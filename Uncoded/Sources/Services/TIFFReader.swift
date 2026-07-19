@@ -168,15 +168,51 @@ struct TIFFReader {
         v == v.rounded() ? String(Int(v)) : String(v)
     }
 
+    // MARK: - Structure (for TIFFWriter)
+
+    /// One IFD entry's location in the file. `fieldOffset` is the absolute
+    /// offset of the entry's 4-byte value/offset field; the count field sits
+    /// at `fieldOffset - 4`.
+    struct TIFFEntry {
+        let tag: UInt16
+        let type: UInt16
+        let count: Int
+        let fieldOffset: Int
+    }
+
+    /// The parsed layout of the file's lens-relevant IFDs.
+    struct TIFFStructure {
+        let littleEndian: Bool
+        let ifd0Offset: Int
+        let exifIFDOffset: Int?
+        let ifd0: [UInt16: TIFFEntry]
+        let exif: [UInt16: TIFFEntry]
+    }
+
+    func structure() throws -> TIFFStructure {
+        let ifd0 = try parseIFD(at: ifd0Offset)
+        var exif: [UInt16: Entry] = [:]
+        var exifOffset: Int?
+        if let pointer = ifd0[Tag.exifIFD], let offset = uintValue(pointer) {
+            exifOffset = Int(offset)
+            exif = try parseIFD(at: Int(offset))
+        }
+        func convert(_ entries: [UInt16: Entry]) -> [UInt16: TIFFEntry] {
+            entries.mapValues { TIFFEntry(tag: $0.tag, type: $0.type, count: $0.count, fieldOffset: $0.fieldOffset) }
+        }
+        return TIFFStructure(littleEndian: littleEndian, ifd0Offset: ifd0Offset,
+                             exifIFDOffset: exifOffset, ifd0: convert(ifd0), exif: convert(exif))
+    }
+
     // MARK: - Primitive reads
 
-    private static func u16(_ data: Data, at offset: Int, littleEndian: Bool) -> UInt16? {
+    static func u16(_ data: Data, at offset: Int, littleEndian: Bool) -> UInt16? {
         guard offset >= 0, offset + 2 <= data.count else { return nil }
         let a = UInt16(data[offset]), b = UInt16(data[offset + 1])
         return littleEndian ? (b << 8 | a) : (a << 8 | b)
     }
 
-    private static func u32(_ data: Data, at offset: Int, littleEndian: Bool) -> UInt32? {
+    static func u32(_ data: Data, at offset: Int, littleEndian: Bool) -> UInt32? {
         guard offset >= 0, offset + 4 <= data.count else { return nil }
         let b0 = UInt32(data[offset]), b1 = UInt32(data[offset + 1])
         let b2 = UInt32(data[offset + 2]), b3 = UInt32(data[offset + 3])

@@ -29,6 +29,23 @@ final class UserLens {
     }
 }
 
+extension UserLens {
+    /// The metadata write this lens implies, parsing "35.0mm" and "f/2".
+    var lensWrite: LensWrite {
+        let focal = Double(focalLength.lowercased()
+            .replacingOccurrences(of: "mm", with: "")
+            .trimmingCharacters(in: .whitespaces))
+        let aperture = Double(self.aperture.lowercased()
+            .replacingOccurrences(of: "f/", with: "")
+            .trimmingCharacters(in: .whitespaces))
+        return LensWrite(lensMake: make, lensModel: name,
+                         focalMM: focal, apertureF: aperture,
+                         profileName: profileName,
+                         profileFilename: profileFilename,
+                         profileDigest: profileDigest)
+    }
+}
+
 /// Maps a borrowed Leica 6-bit code to the user's real lens.
 @Model
 final class CodeMapping {
