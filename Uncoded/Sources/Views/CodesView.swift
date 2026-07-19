@@ -14,12 +14,10 @@ struct CodesView: View {
 
     private var filteredCodes: [String] {
         guard !search.isEmpty else { return SixBitTable.uniqueCodes }
-        let q = search.lowercased()
         return SixBitTable.uniqueCodes.filter { code in
-            code.contains(q) || (SixBitTable.byCode[code] ?? []).contains {
-                $0.lensName.lowercased().contains(q) ||
-                    $0.productCodes.contains { $0.lowercased().contains(q) }
-            }
+            let entries = SixBitTable.byCode[code] ?? []
+            return Search.matches(search, in: [code] + entries.map(\.lensName)
+                + entries.flatMap(\.productCodes))
         }
     }
 

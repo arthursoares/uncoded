@@ -139,10 +139,7 @@ private struct AddLensSheet: View {
 
     private var filtered: [LCPProfile] {
         guard !search.isEmpty else { return profiles }
-        let q = search.lowercased()
-        return profiles.filter {
-            ($0.lensPrettyName ?? "").lowercased().contains(q) || $0.maker.lowercased().contains(q)
-        }
+        return profiles.filter { Search.matches(search, in: [$0.lensPrettyName, $0.maker]) }
     }
 
     var body: some View {

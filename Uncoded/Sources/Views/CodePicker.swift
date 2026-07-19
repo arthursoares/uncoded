@@ -10,11 +10,8 @@ struct CodePickerList: View {
     private var ranked: [String] {
         let codes = SixBitTable.ranked(for: LensNameParser.parse(suggestionSeed))
         guard !search.isEmpty else { return codes }
-        let q = search.lowercased()
         return codes.filter { code in
-            code.contains(q) || (SixBitTable.byCode[code] ?? []).contains {
-                $0.lensName.lowercased().contains(q)
-            }
+            Search.matches(search, in: [code] + (SixBitTable.byCode[code] ?? []).map(\.lensName))
         }
     }
 
