@@ -1,0 +1,616 @@
+[
+ {
+  "code": "110100",
+  "lens_name": "Super-Elmar-M 18mm f/3.8 ASPH",
+  "product_codes": [
+   "11649"
+  ],
+  "leica_index": "52"
+ },
+ {
+  "code": "101111",
+  "lens_name": "Summilux-M 21mm f/1.4 ASPH",
+  "product_codes": [
+   "11647"
+  ],
+  "leica_index": "47"
+ },
+ {
+  "code": "000001",
+  "lens_name": "Elmarit-M 21mm f/2.8",
+  "product_codes": [
+   "11134"
+  ],
+  "leica_index": "1"
+ },
+ {
+  "code": "011000",
+  "lens_name": "Elmarit-M 21mm f/2.8 ASPH",
+  "product_codes": [
+   "11135",
+   "11897 (chrome)"
+  ],
+  "leica_index": "24"
+ },
+ {
+  "code": "110011",
+  "lens_name": "Super-Elmar-M 21mm f/3.4",
+  "product_codes": [
+   "11145"
+  ],
+  "leica_index": "51"
+ },
+ {
+  "code": "110000",
+  "lens_name": "Summilux-M 24mm f/1.4 ASPH",
+  "product_codes": [
+   "11601"
+  ],
+  "leica_index": "48"
+ },
+ {
+  "code": "011001",
+  "lens_name": "Elmarit-M 24mm f/2.8 ASPH",
+  "product_codes": [
+   "11878",
+   "11898 (chrome)"
+  ],
+  "leica_index": "25"
+ },
+ {
+  "code": "110010",
+  "lens_name": "Elmar-M 24mm f/3.8 ASPH",
+  "product_codes": [
+   "11648"
+  ],
+  "leica_index": "50"
+ },
+ {
+  "code": "110110",
+  "lens_name": "Summilux-M 28mm f/1.4 ASPH",
+  "product_codes": [
+   "11668",
+   "11911 (chrome)"
+  ],
+  "leica_index": "54"
+ },
+ {
+  "code": "011010",
+  "lens_name": "Summicron-M 28mm f/2 ASPH ( II)",
+  "product_codes": [
+   "11672"
+  ],
+  "leica_index": "26"
+ },
+ {
+  "code": "011010",
+  "lens_name": "Summicron-M 28mm f/2 ASPH (I)",
+  "product_codes": [
+   "11604",
+   "11661 (chrome)"
+  ],
+  "leica_index": "26"
+ },
+ {
+  "code": "011010",
+  "lens_name": "Summicron-M 28mm f/2 ASPH ( III)",
+  "product_codes": [
+   "11618"
+  ],
+  "leica_index": "26"
+ },
+ {
+  "code": "000011",
+  "lens_name": "Elmarit-M 28mm f/2.8 (III)",
+  "product_codes": [
+   "11804"
+  ],
+  "leica_index": "3"
+ },
+ {
+  "code": "011011",
+  "lens_name": "Elmarit-M 28mm f/2.8 (IV)",
+  "product_codes": [
+   "11809"
+  ],
+  "leica_index": "27"
+ },
+ {
+  "code": "011100",
+  "lens_name": "Elmarit-M 28mm f/2.8 ASPH (I)",
+  "product_codes": [
+   "11606"
+  ],
+  "leica_index": "28"
+ },
+ {
+  "code": "011100",
+  "lens_name": "Elmarit-M 28mm f/2.8 ASPH (II)",
+  "product_codes": [
+   "11677"
+  ],
+  "leica_index": "28"
+ },
+ {
+  "code": "001011",
+  "lens_name": "Summaron-M 28mm f/5.6 (re)",
+  "product_codes": [
+   "11695",
+   "11928"
+  ],
+  "leica_index": "11"
+ },
+ {
+  "code": "001100",
+  "lens_name": "Summilux-M 35mm f/1.4 steel rim (re)",
+  "product_codes": [
+   "11300",
+   "11301 (chrome)"
+  ],
+  "leica_index": "12"
+ },
+ {
+  "code": "011101",
+  "lens_name": "Summilux-M 35mm f/1.4 ASPH",
+  "product_codes": [
+   "11874",
+   "11883 (chrome)"
+  ],
+  "leica_index": "29"
+ },
+ {
+  "code": "011101",
+  "lens_name": "Summilux-M 35mm f/1.4 ASPH (FLE I)",
+  "product_codes": [
+   "11663",
+   "11675 (chrome)"
+  ],
+  "leica_index": "29"
+ },
+ {
+  "code": "011101",
+  "lens_name": "Summilux-M 35mm f/1.4 ASPH (FLE II)",
+  "product_codes": [
+   "11726",
+   "11727"
+  ],
+  "leica_index": "29"
+ },
+ {
+  "code": "000110",
+  "lens_name": "Summicron-M 35mm f/2 (IV)",
+  "product_codes": [
+   "11310",
+   "11311 (chrome)"
+  ],
+  "leica_index": "6"
+ },
+ {
+  "code": "001101",
+  "lens_name": "APO-Summicron-M 35mm f/2 ASPH",
+  "product_codes": [
+   "11699"
+  ],
+  "leica_index": "13"
+ },
+ {
+  "code": "011110",
+  "lens_name": "Summicron-M 35mm f/2 ASPH (I)",
+  "product_codes": [
+   "11879",
+   "11882 (chrome)"
+  ],
+  "leica_index": "30"
+ },
+ {
+  "code": "011110",
+  "lens_name": "Summicron-M 35mm f/2 ASPH (II)",
+  "product_codes": [
+   "11673",
+   "11674 (chrome)"
+  ],
+  "leica_index": "30"
+ },
+ {
+  "code": "010001",
+  "lens_name": "Summarit-M 35mm f/2.4",
+  "product_codes": [
+   "11671"
+  ],
+  "leica_index": "17"
+ },
+ {
+  "code": "101011",
+  "lens_name": "Summarit-M 35mm f/2.5",
+  "product_codes": [
+   "11643"
+  ],
+  "leica_index": "43"
+ },
+ {
+  "code": "110001",
+  "lens_name": "Noctilux-M 50mm f/0.95 ASPH",
+  "product_codes": [
+   "11602",
+   "11612 (titan)",
+   "11667 (chr"
+  ],
+  "leica_index": "49"
+ },
+ {
+  "code": "011111",
+  "lens_name": "Noctilux-M 50mm f/1",
+  "product_codes": [
+   "11821",
+   "11822"
+  ],
+  "leica_index": "31"
+ },
+ {
+  "code": "001110",
+  "lens_name": "Noctilux-M 50mm f/1.2 ASPH (re)",
+  "product_codes": [
+   "11686"
+  ],
+  "leica_index": "14"
+ },
+ {
+  "code": "000101",
+  "lens_name": "Summilux-M 50mm f/1.4 (II)",
+  "product_codes": [
+   "11868",
+   "11856 (chrome)"
+  ],
+  "leica_index": "5"
+ },
+ {
+  "code": "100000",
+  "lens_name": "Summilux-M 50mm f/1.4 ASPH (I)",
+  "product_codes": [
+   "11891",
+   "11892 (chrome)"
+  ],
+  "leica_index": "32"
+ },
+ {
+  "code": "100000",
+  "lens_name": "Summilux-M 50mm f/1.4 ASPH (II)",
+  "product_codes": [
+   "11728",
+   "11729 (chrome)"
+  ],
+  "leica_index": "32"
+ },
+ {
+  "code": "010111",
+  "lens_name": "Summicron-M 50mm f/2 (III)",
+  "product_codes": [
+   "11817"
+  ],
+  "leica_index": "23"
+ },
+ {
+  "code": "100001",
+  "lens_name": "Summicron-M 50mm f/2 (IV)",
+  "product_codes": [
+   "11819",
+   "11816 (chrome)"
+  ],
+  "leica_index": "33"
+ },
+ {
+  "code": "100001",
+  "lens_name": "Summicron-M 50mm f/2 (V)",
+  "product_codes": [
+   "11826",
+   "11825 (chrome)"
+  ],
+  "leica_index": "33"
+ },
+ {
+  "code": "101001",
+  "lens_name": "APO-Summicron-M 50mm f/2 ASPH",
+  "product_codes": [
+   "11141",
+   "11811 (black chrome)"
+  ],
+  "leica_index": "41"
+ },
+ {
+  "code": "010010",
+  "lens_name": "Summarit-M 50mm f/2.4",
+  "product_codes": [
+   "11680",
+   "11681 (chrome)"
+  ],
+  "leica_index": "18"
+ },
+ {
+  "code": "101100",
+  "lens_name": "Summarit-M 50mm f/2.5",
+  "product_codes": [
+   "11644"
+  ],
+  "leica_index": "44"
+ },
+ {
+  "code": "100010",
+  "lens_name": "Elmar-M 50mm f/2.8",
+  "product_codes": [
+   "11831",
+   "11824",
+   "11823 (chrome)"
+  ],
+  "leica_index": "34"
+ },
+ {
+  "code": "111010",
+  "lens_name": "Noctilux-M 75mm f/1,25",
+  "product_codes": [
+   "11676"
+  ],
+  "leica_index": "58"
+ },
+ {
+  "code": "100011",
+  "lens_name": "Summilux-M 75mm f/1.4",
+  "product_codes": [
+   "11810",
+   "11814",
+   "11815"
+  ],
+  "leica_index": "35"
+ },
+ {
+  "code": "100100",
+  "lens_name": "APO-Summicron-M 75mm f/2 ASPH",
+  "product_codes": [
+   "11637"
+  ],
+  "leica_index": "36"
+ },
+ {
+  "code": "010011",
+  "lens_name": "Summarit-M 75mm f/2.4",
+  "product_codes": [
+   "11645",
+   "11683 (chrome)"
+  ],
+  "leica_index": "19"
+ },
+ {
+  "code": "101101",
+  "lens_name": "Summarit-M 75mm f/2.5",
+  "product_codes": [
+   "11682"
+  ],
+  "leica_index": "45"
+ },
+ {
+  "code": "111011",
+  "lens_name": "Summilux 90mm f/1,5",
+  "product_codes": [
+   "11678"
+  ],
+  "leica_index": "59"
+ },
+ {
+  "code": "000111",
+  "lens_name": "Summicron-M 90mm f/2 (II)",
+  "product_codes": [
+   "11136",
+   "11137 (chrome)"
+  ],
+  "leica_index": "7"
+ },
+ {
+  "code": "100101",
+  "lens_name": "APO-Summicron-M 90mm f/2 ASPH",
+  "product_codes": [
+   "11884",
+   "11885 (chrome)"
+  ],
+  "leica_index": "37"
+ },
+ {
+  "code": "001100",
+  "lens_name": "Thambar-M 90mm f/2.2",
+  "product_codes": [
+   "11697"
+  ],
+  "leica_index": "12"
+ },
+ {
+  "code": "010100",
+  "lens_name": "Summarit-M 90mm f/2.4",
+  "product_codes": [
+   "11684",
+   "11685 (chrome)"
+  ],
+  "leica_index": "20"
+ },
+ {
+  "code": "101110",
+  "lens_name": "Summarit-M 90mm f/2.5",
+  "product_codes": [
+   "11646"
+  ],
+  "leica_index": "46"
+ },
+ {
+  "code": "000100",
+  "lens_name": "Tele-Elmarit-M 90mm f/2.8 (II)",
+  "product_codes": [
+   "11800"
+  ],
+  "leica_index": "4"
+ },
+ {
+  "code": "100110",
+  "lens_name": "Elmarit-M 90mm f/2.8",
+  "product_codes": [
+   "11807",
+   "11808 (chrome)"
+  ],
+  "leica_index": "38"
+ },
+ {
+  "code": "100111",
+  "lens_name": "Macro-Elmar-M 90mm f/4",
+  "product_codes": [
+   "11670"
+  ],
+  "leica_index": "39"
+ },
+ {
+  "code": "100111",
+  "lens_name": "Macro-Elmar-M 90mm f/4",
+  "product_codes": [
+   "11633",
+   "11634 (chrome)"
+  ],
+  "leica_index": "39"
+ },
+ {
+  "code": "001001",
+  "lens_name": "Elmarit-M 135mm f/2.8 (I)",
+  "product_codes": [
+   "11829 ?"
+  ],
+  "leica_index": "9"
+ },
+ {
+  "code": "001001",
+  "lens_name": "Elmarit-M 135mm f/2.8 (II)",
+  "product_codes": [
+   "11829 ?"
+  ],
+  "leica_index": "9"
+ },
+ {
+  "code": "110101",
+  "lens_name": "APO-Telyt-M 135mm f/3.4",
+  "product_codes": [
+   "11889"
+  ],
+  "leica_index": "53"
+ },
+ {
+  "code": "010000",
+  "lens_name": "Tri-Elmar-M 16-18-21mm f/4 ASPH",
+  "product_codes": [
+   "11626"
+  ],
+  "leica_index": "16"
+ },
+ {
+  "code": "101010",
+  "lens_name": "Tri-Elmar-M 28-35-50mm f/4 ASPH",
+  "product_codes": [
+   "11890",
+   "11625",
+   "11894 (chrome)"
+  ],
+  "leica_index": "42"
+ },
+ {
+  "code": "101000",
+  "lens_name": "Macro-Adapter-M",
+  "product_codes": [
+   "14409"
+  ],
+  "leica_index": "40"
+ },
+ {
+  "code": "111001",
+  "lens_name": "Macro-Adapter-M",
+  "product_codes": [
+   "14652"
+  ],
+  "leica_index": "57"
+ },
+ {
+  "code": "000000",
+  "lens_name": "N/A",
+  "product_codes": [],
+  "leica_index": "0"
+ },
+ {
+  "code": "000010",
+  "lens_name": "N/A",
+  "product_codes": [],
+  "leica_index": "2"
+ },
+ {
+  "code": "001000",
+  "lens_name": "N/A",
+  "product_codes": [],
+  "leica_index": "8"
+ },
+ {
+  "code": "001010",
+  "lens_name": "N/A",
+  "product_codes": [],
+  "leica_index": "10"
+ },
+ {
+  "code": "001111",
+  "lens_name": "N/A",
+  "product_codes": [],
+  "leica_index": "15"
+ },
+ {
+  "code": "010101",
+  "lens_name": "N/A",
+  "product_codes": [],
+  "leica_index": "21"
+ },
+ {
+  "code": "010110",
+  "lens_name": "N/A",
+  "product_codes": [],
+  "leica_index": "22"
+ },
+ {
+  "code": "110111",
+  "lens_name": "N/A",
+  "product_codes": [],
+  "leica_index": "55"
+ },
+ {
+  "code": "111000",
+  "lens_name": "N/A",
+  "product_codes": [],
+  "leica_index": "56"
+ },
+ {
+  "code": "111011",
+  "lens_name": "N/A",
+  "product_codes": [],
+  "leica_index": "59"
+ },
+ {
+  "code": "111100",
+  "lens_name": "N/A",
+  "product_codes": [],
+  "leica_index": "60"
+ },
+ {
+  "code": "111101",
+  "lens_name": "N/A",
+  "product_codes": [],
+  "leica_index": "61"
+ },
+ {
+  "code": "111110",
+  "lens_name": "N/A",
+  "product_codes": [],
+  "leica_index": "62"
+ },
+ {
+  "code": "111111",
+  "lens_name": "N/A",
+  "product_codes": [],
+  "leica_index": "63"
+ }
+]
