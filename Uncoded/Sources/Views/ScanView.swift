@@ -4,12 +4,17 @@ import SwiftData
 /// Scans a folder of DNGs and shows what each file claims vs. the truth
 /// according to the user's code mappings. Read-only for now.
 struct ScanView: View {
+    private enum Mode: String, CaseIterable {
+        case sheet, list
+    }
+
     @Query private var mappings: [CodeMapping]
 
     @State private var folder: URL?
     @State private var results: [ScannedDNG] = []
     @State private var scanning = false
     @State private var showPicker = false
+    @State private var mode: Mode = .sheet
 
     private var mappingByCode: [String: CodeMapping] {
         Dictionary(mappings.map { ($0.code, $0) }, uniquingKeysWith: { a, _ in a })
@@ -20,12 +25,19 @@ struct ScanView: View {
             if results.isEmpty && !scanning {
                 dropZone
             } else {
-                resultsList
+                resultsArea
             }
         }
         .background(Theme.bg)
         .navigationTitle("Scan")
         .toolbar {
+            if !results.isEmpty {
+                Picker("View", selection: $mode) {
+                    Image(systemName: "square.grid.3x2").tag(Mode.sheet)
+                    Image(systemName: "list.bullet").tag(Mode.list)
+                }
+                .pickerStyle(.segmented)
+            }
             Button {
                 showPicker = true
             } label: {
@@ -61,7 +73,7 @@ struct ScanView: View {
         }
     }
 
-    private var resultsList: some View {
+    private var resultsArea: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 18) {
                 if let folder {
@@ -75,7 +87,7 @@ struct ScanView: View {
                 if scanning {
                     ProgressView().controlSize(.small)
                 } else {
-                    stat("\(results.count)", "files")
+                    stat("\(results.count)", "frames")
                     stat("\(results.filter { $0.matchedCode != nil }.count)", "coded")
                     stat("\(results.filter { mapped($0) != nil }.count)", "mapped")
                 }
@@ -85,11 +97,16 @@ struct ScanView: View {
 
             Divider().overlay(Theme.panelEdge)
 
-            List(results) { file in
-                ScanRow(file: file, realLens: mapped(file))
-                    .listRowSeparatorTint(Theme.panelEdge)
+            switch mode {
+            case .sheet:
+                ContactSheet(results: results, realLens: mapped)
+            case .list:
+                List(results) { file in
+                    ScanRow(file: file, realLens: mapped(file))
+                        .listRowSeparatorTint(Theme.panelEdge)
+                }
+                .scrollContentBackground(.hidden)
             }
-            .scrollContentBackground(.hidden)
         }
     }
 
@@ -118,6 +135,111 @@ struct ScanView: View {
         }
     }
 }
+
+// MARK: - Contact sheet
+
+/// The scan as a film contact sheet: black frames on a dark ground, with the
+/// filename and code printed beneath each frame like edge markings on the
+/// rebate of a strip of film.
+private struct ContactSheet: View {
+    let results: [ScannedDNG]
+    let realLens: (ScannedDNG) -> UserLens?
+
+    var body: some View {
+        ScrollView {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 178, maximum: 260), spacing: 14)],
+                      spacing: 16) {
+                ForEach(Array(results.enumerated()), id: \.element.id) { index, file in
+                    FrameCell(file: file, frameNumber: index + 1, realLens: realLens(file))
+                }
+            }
+            .padding(16)
+        }
+        .background(Color.black.opacity(0.35))
+    }
+}
+
+private struct FrameCell: View {
+    let file: ScannedDNG
+    let frameNumber: Int
+    let realLens: UserLens?
+
+    @State private var image: NSImage?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ZStack {
+                Rectangle().fill(Color.black)
+                if let image {
+                    Image(nsImage: image)
+                        .resizable()
+                        .scaledToFill()
+                } else {
+                    Image(systemName: "camera.aperture")
+                        .font(.system(size: 22, weight: .thin))
+                        .foregroundStyle(Theme.faint)
+                }
+            }
+            .frame(height: 132)
+            .clipped()
+
+            // Rebate: frame number + filename as edge print, code as pits.
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text(String(format: "%02d", frameNumber))
+                        .font(Theme.mono(9))
+                        .foregroundStyle(Theme.rebate)
+                    Text(file.filename)
+                        .font(Theme.mono(9))
+                        .foregroundStyle(Theme.rebate.opacity(0.8))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer()
+                    if let code = file.matchedCode {
+                        BitPatternView(code: code.code, dotSize: 5)
+                    }
+                }
+
+                HStack(spacing: 4) {
+                    if let realLens {
+                        Image(systemName: "arrow.turn.down.right")
+                            .font(.system(size: 7))
+                            .foregroundStyle(Theme.ok)
+                        Text(realLens.name)
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(Theme.ok)
+                            .lineLimit(1)
+                    } else if file.matchedCode != nil {
+                        Text("code not mapped")
+                            .font(.system(size: 9))
+                            .foregroundStyle(Theme.faint)
+                    } else {
+                        Text(file.claimedLens ?? "no lens metadata")
+                            .font(.system(size: 9))
+                            .foregroundStyle(Theme.faint)
+                            .lineLimit(1)
+                    }
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(Color.black)
+        }
+        .overlay(Rectangle().strokeBorder(Theme.panelEdge.opacity(0.6), lineWidth: 1))
+        .help(helpText)
+        .task { image = await ThumbnailLoader.thumbnail(for: file.url) }
+    }
+
+    private var helpText: String {
+        var lines = [file.filename]
+        if let claimed = file.claimedLens { lines.append("claims: \(claimed)") }
+        if let code = file.matchedCode { lines.append("code \(code.code) — \(code.lensName)") }
+        if let realLens { lines.append("actually: \(realLens.name)") }
+        return lines.joined(separator: "\n")
+    }
+}
+
+// MARK: - List rows
 
 private struct ScanRow: View {
     let file: ScannedDNG

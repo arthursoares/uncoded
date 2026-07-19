@@ -11,6 +11,7 @@ enum Theme {
     static let faint = Color(white: 0.35)
     static let accent = Color(red: 0.878, green: 0.106, blue: 0.141) // Leica red
     static let ok = Color(red: 0.55, green: 0.78, blue: 0.45)
+    static let rebate = Color(red: 0.93, green: 0.64, blue: 0.25) // film edge-print amber
 
     static func code(_ size: CGFloat = 22) -> Font {
         .system(size: size, weight: .medium, design: .monospaced)
