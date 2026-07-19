@@ -8,5 +8,9 @@ struct UncodedApp: App {
             ContentView()
         }
         .modelContainer(for: [UserLens.self, CodeMapping.self])
+
+        Settings {
+            SettingsView()
+        }
     }
 }

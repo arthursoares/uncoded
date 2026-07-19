@@ -1,10 +1,10 @@
 import SwiftUI
 import SwiftData
 
-/// Scans a folder of DNGs and shows what each file claims vs. the truth
-/// according to the user's code mappings. Frames can be marked (like a
-/// contact sheet) and manually assigned a lens, overriding the code mapping.
-/// Read-only for now.
+/// Scans a folder of DNGs, shows what each file claims vs. the truth according
+/// to the user's code mappings (plus per-frame manual overrides), and applies
+/// the fixes with the native write engine — .bak copies per Settings, undo
+/// journal always.
 struct ScanView: View {
     private enum Mode: String, CaseIterable {
         case sheet, list
@@ -16,8 +16,15 @@ struct ScanView: View {
         let isManual: Bool
     }
 
+    /// Per-file fix outcome for this session.
+    enum FrameFix {
+        case fixed
+        case failed(String)
+    }
+
     @Query private var mappings: [CodeMapping]
     @Query(sort: \UserLens.name) private var lenses: [UserLens]
+    @AppStorage("keepBakBackups") private var keepBak = true
 
     @State private var folder: URL?
     @State private var results: [ScannedDNG] = []
@@ -26,9 +33,20 @@ struct ScanView: View {
     @State private var mode: Mode = .sheet
     @State private var selection = Set<URL>()
     @State private var overrides: [URL: UserLens] = [:]
+    @State private var fixState: [URL: FrameFix] = [:]
+    @State private var confirmFix = false
+    @State private var fixing = false
 
     private var mappingByCode: [String: CodeMapping] {
         Dictionary(mappings.map { ($0.code, $0) }, uniquingKeysWith: { a, _ in a })
+    }
+
+    /// Frames that resolve to a lens and haven't been fixed yet.
+    private var fixable: [(ScannedDNG, UserLens)] {
+        results.compactMap { file in
+            guard fixState[file.url] == nil, let lens = resolve(file).lens else { return nil }
+            return (file, lens)
+        }
     }
 
     var body: some View {
@@ -60,6 +78,17 @@ struct ScanView: View {
         }
         .safeAreaInset(edge: .bottom) {
             if !selection.isEmpty { markBar }
+        }
+        .confirmationDialog(
+            "Fix \(fixable.count) frame\(fixable.count == 1 ? "" : "s")?",
+            isPresented: $confirmFix, titleVisibility: .visible
+        ) {
+            Button("Rewrite Metadata") { runFix() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(keepBak
+                ? "Lens metadata is rewritten in place. A one-time .bak copy is kept next to each file, and every fix records an undo journal."
+                : "Lens metadata is rewritten in place. No .bak copies (per Settings) — every fix still records an undo journal.")
         }
     }
 
@@ -104,6 +133,20 @@ struct ScanView: View {
                     stat("\(results.count)", "frames")
                     stat("\(results.filter { $0.matchedCode != nil }.count)", "coded")
                     stat("\(results.filter { resolve($0).lens != nil }.count)", "mapped")
+                    let fixedCount = fixState.values.filter { if case .fixed = $0 { return true }; return false }.count
+                    if fixedCount > 0 {
+                        stat("\(fixedCount)", "fixed")
+                    }
+                    if fixing {
+                        ProgressView().controlSize(.small)
+                    } else if !fixable.isEmpty {
+                        Button("Fix \(fixable.count) frame\(fixable.count == 1 ? "" : "s")") {
+                            confirmFix = true
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(Theme.accent)
+                        .controlSize(.small)
+                    }
                 }
             }
             .padding(.horizontal, 16)
@@ -115,13 +158,21 @@ struct ScanView: View {
             case .sheet:
                 ContactSheet(results: results,
                              resolve: resolve,
+                             fixInfo: { fixState[$0.url] },
                              isSelected: { selection.contains($0.url) },
-                             onTap: { toggleMark($0) })
+                             onTap: { toggleMark($0) },
+                             onRevert: { revert($0) })
             case .list:
                 List(results) { file in
-                    ScanRow(file: file, resolution: resolve(file))
+                    ScanRow(file: file, resolution: resolve(file), fix: fixState[file.url])
                         .listRowSeparatorTint(Theme.panelEdge)
-                        .contextMenu { assignMenu(for: [file.url]) }
+                        .contextMenu {
+                            assignMenu(for: [file.url])
+                            if case .fixed = fixState[file.url] {
+                                Divider()
+                                Button("Revert Fix") { revert(file) }
+                            }
+                        }
                 }
                 .scrollContentBackground(.hidden)
             }
@@ -198,12 +249,66 @@ struct ScanView: View {
         selection = []
     }
 
+    // MARK: - Fix / revert
+
+    private func runFix() {
+        let work = fixable.map { ($0.0.url, $0.1.lensWrite) }
+        let bak = keepBak
+        fixing = true
+        Task {
+            for (url, write) in work {
+                let outcome: FrameFix = await Task.detached(priority: .userInitiated) {
+                    do {
+                        try Fixer.fix(file: url, with: write, keepBak: bak)
+                        return .fixed
+                    } catch {
+                        return .failed(error.localizedDescription)
+                    }
+                }.value
+                fixState[url] = outcome
+                if case .fixed = outcome { await refresh(url) }
+            }
+            fixing = false
+        }
+    }
+
+    private func revert(_ file: ScannedDNG) {
+        Task {
+            let error: String? = await Task.detached(priority: .userInitiated) {
+                do {
+                    try Fixer.revert(file: file.url)
+                    return nil
+                } catch {
+                    return error.localizedDescription
+                }
+            }.value
+            if let error {
+                fixState[file.url] = .failed(error)
+            } else {
+                fixState[file.url] = nil
+                await refresh(file.url)
+            }
+        }
+    }
+
+    /// Re-reads one file's metadata so the frame reflects what's on disk now.
+    private func refresh(_ url: URL) async {
+        let updated: ScannedDNG? = await Task.detached(priority: .userInitiated) {
+            guard let meta = try? TIFFReader.read(url: url) else { return nil }
+            return ScannedDNG(url: url, meta: meta,
+                              matchedCode: SixBitTable.match(lensModel: meta.lensModel))
+        }.value
+        guard let updated, let index = results.firstIndex(where: { $0.url == url }) else { return }
+        results[index] = updated
+    }
+
     private func scan(_ url: URL) {
         folder = url
         scanning = true
         results = []
         selection = []
         overrides = [:]
+        fixState = [:]
         Task {
             let found = await Task.detached(priority: .userInitiated) {
                 DNGScanner.scan(folder: url)
@@ -222,8 +327,10 @@ struct ScanView: View {
 private struct ContactSheet: View {
     let results: [ScannedDNG]
     let resolve: (ScannedDNG) -> ScanView.Resolution
+    let fixInfo: (ScannedDNG) -> ScanView.FrameFix?
     let isSelected: (ScannedDNG) -> Bool
     let onTap: (ScannedDNG) -> Void
+    let onRevert: (ScannedDNG) -> Void
 
     var body: some View {
         ScrollView {
@@ -233,8 +340,14 @@ private struct ContactSheet: View {
                     FrameCell(file: file,
                               frameNumber: index + 1,
                               resolution: resolve(file),
+                              fix: fixInfo(file),
                               selected: isSelected(file))
                         .onTapGesture { onTap(file) }
+                        .contextMenu {
+                            if case .fixed = fixInfo(file) {
+                                Button("Revert Fix") { onRevert(file) }
+                            }
+                        }
                 }
             }
             .padding(16)
@@ -247,6 +360,7 @@ private struct FrameCell: View {
     let file: ScannedDNG
     let frameNumber: Int
     let resolution: ScanView.Resolution
+    let fix: ScanView.FrameFix?
     let selected: Bool
 
     @State private var image: NSImage?
@@ -290,26 +404,46 @@ private struct FrameCell: View {
                 }
 
                 HStack(spacing: 4) {
-                    if let lens = resolution.lens {
-                        Image(systemName: "arrow.turn.down.right")
-                            .font(.system(size: 7))
+                    switch fix {
+                    case .fixed:
+                        Image(systemName: "checkmark.seal.fill")
+                            .font(.system(size: 8))
                             .foregroundStyle(Theme.ok)
-                        Text(lens.name)
+                        Text(file.claimedLens ?? "")
                             .font(.system(size: 9, weight: .medium))
                             .foregroundStyle(Theme.ok)
                             .lineLimit(1)
-                        if resolution.isManual {
-                            EngravedLabel("manual", color: Theme.rebate)
-                        }
-                    } else if file.matchedCode != nil {
-                        Text("code not mapped")
+                        EngravedLabel("fixed", color: Theme.ok)
+                    case .failed(let message):
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 8))
+                            .foregroundStyle(Theme.accent)
+                        Text(message)
                             .font(.system(size: 9))
-                            .foregroundStyle(Theme.faint)
-                    } else {
-                        Text(file.claimedLens ?? "no lens metadata")
-                            .font(.system(size: 9))
-                            .foregroundStyle(Theme.faint)
+                            .foregroundStyle(Theme.accent)
                             .lineLimit(1)
+                    case nil:
+                        if let lens = resolution.lens {
+                            Image(systemName: "arrow.turn.down.right")
+                                .font(.system(size: 7))
+                                .foregroundStyle(Theme.ok)
+                            Text(lens.name)
+                                .font(.system(size: 9, weight: .medium))
+                                .foregroundStyle(Theme.ok)
+                                .lineLimit(1)
+                            if resolution.isManual {
+                                EngravedLabel("manual", color: Theme.rebate)
+                            }
+                        } else if file.matchedCode != nil {
+                            Text("code not mapped")
+                                .font(.system(size: 9))
+                                .foregroundStyle(Theme.faint)
+                        } else {
+                            Text(file.claimedLens ?? "no lens metadata")
+                                .font(.system(size: 9))
+                                .foregroundStyle(Theme.faint)
+                                .lineLimit(1)
+                        }
                     }
                 }
             }
@@ -333,6 +467,7 @@ private struct FrameCell: View {
         if let lens = resolution.lens {
             lines.append("actually: \(lens.name)\(resolution.isManual ? " (manual)" : "")")
         }
+        if case .fixed = fix { lines.append("fixed — right-click to revert") }
         return lines.joined(separator: "\n")
     }
 }
@@ -342,6 +477,7 @@ private struct FrameCell: View {
 private struct ScanRow: View {
     let file: ScannedDNG
     let resolution: ScanView.Resolution
+    let fix: ScanView.FrameFix?
 
     var body: some View {
         HStack(spacing: 14) {
@@ -363,23 +499,37 @@ private struct ScanRow: View {
                     .foregroundStyle(file.claimedLens == nil ? Theme.faint : Theme.dim)
                     .lineLimit(1)
 
-                if let lens = resolution.lens {
+                switch fix {
+                case .fixed:
                     HStack(spacing: 5) {
-                        Image(systemName: "arrow.turn.down.right")
+                        Image(systemName: "checkmark.seal.fill")
                             .font(.system(size: 8))
                             .foregroundStyle(Theme.ok)
-                        Text(lens.name)
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(Theme.ok)
-                            .lineLimit(1)
-                        if resolution.isManual {
-                            EngravedLabel("manual", color: Theme.rebate)
-                        }
+                        EngravedLabel("fixed", color: Theme.ok)
                     }
-                } else if file.matchedCode != nil {
-                    Text("code not mapped to one of your lenses")
+                case .failed(let message):
+                    Text(message)
                         .font(.system(size: 10))
-                        .foregroundStyle(Theme.faint)
+                        .foregroundStyle(Theme.accent)
+                case nil:
+                    if let lens = resolution.lens {
+                        HStack(spacing: 5) {
+                            Image(systemName: "arrow.turn.down.right")
+                                .font(.system(size: 8))
+                                .foregroundStyle(Theme.ok)
+                            Text(lens.name)
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(Theme.ok)
+                                .lineLimit(1)
+                            if resolution.isManual {
+                                EngravedLabel("manual", color: Theme.rebate)
+                            }
+                        }
+                    } else if file.matchedCode != nil {
+                        Text("code not mapped to one of your lenses")
+                            .font(.system(size: 10))
+                            .foregroundStyle(Theme.faint)
+                    }
                 }
             }
             Spacer()
