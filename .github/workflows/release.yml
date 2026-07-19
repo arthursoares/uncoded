@@ -1,0 +1,34 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate project
+        run: xcodegen generate
+      - name: Build Release
+        run: |
+          set -o pipefail
+          xcodebuild -scheme Uncoded -configuration Release \
+            -derivedDataPath DerivedData build 2>&1 | tail -30
+      - name: Package DMG
+        run: bash scripts/make_dmg.sh DerivedData/Build/Products/Release/Uncoded.app dist
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.dmg
+          generate_release_notes: true
+          body: |
+            **Unsigned build** — on first launch, right-click Uncoded.app → *Open* → *Open*.
+
+            Requires macOS 14+. The lens-profile picker needs Adobe Lightroom / Camera Raw installed.

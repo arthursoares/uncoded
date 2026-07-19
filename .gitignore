@@ -11,3 +11,4 @@ xcuserdata/
 # Scratch
 *.dng
 *.DNG
+dist/
