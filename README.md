@@ -17,6 +17,14 @@ correction profile.
 Uncoded is a native macOS app that detects those lies and rewrites the
 metadata with the truth.
 
+## Screenshots
+
+| Scan — the contact sheet | Add a lens + its code |
+|---|---|
+| ![Scan view: contact sheet of DNGs with detected 6-bit codes and an unclaimed-code banner](docs/screenshots/scan.png) | ![Add Lens sheet: Lightroom profile picker beside the ranked 6-bit code picker](docs/screenshots/addlens.png) |
+
+![6-Bit Codes: the full code table as pit-pattern cards, mapped lenses highlighted](docs/screenshots/codes.png)
+
 ## What it does
 
 - **Scan** a folder of DNGs and see it as a **contact sheet** — thumbnails
@@ -91,6 +99,10 @@ Uncoded is the native successor of the
   which Uncoded's native metadata engine is validated.
 - Adobe lens correction profiles are read from your local Lightroom /
   Camera Raw installation.
+
+## License
+
+[GPL-3.0](LICENSE).
 
 *Not affiliated with Leica Camera AG or Adobe Inc. Leica is a trademark of
 Leica Camera AG; Lightroom and Camera Raw are trademarks of Adobe Inc.*
