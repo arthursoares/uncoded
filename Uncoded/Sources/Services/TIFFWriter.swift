@@ -198,6 +198,7 @@ struct TIFFWriter {
             ("crs:LensProfileName", write.profileName),
             ("crs:LensProfileFilename", write.profileFilename),
             ("crs:LensProfileDigest", write.profileDigest),
+            ("crs:LensProfileIsEmbedded", "False"),
         ]
 
         if let entry = layout.ifd0[Tag.xmp] {
