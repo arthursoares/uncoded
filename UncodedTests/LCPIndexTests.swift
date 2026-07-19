@@ -15,5 +15,10 @@ final class LCPIndexTests: XCTestCase {
         // M-mount profiles are made for Leica bodies.
         let leicaMade = profiles.filter { $0.cameraMake?.contains("Leica") == true }
         XCTAssertGreaterThan(leicaMade.count, 0)
+
+        // The index is deduped per lens and excludes Leitz Phone profiles.
+        let names = profiles.compactMap(\.lensPrettyName)
+        XCTAssertEqual(names.count, Set(names).count, "expected one entry per lens")
+        XCTAssertFalse(profiles.contains { $0.cameraModel?.localizedCaseInsensitiveContains("phone") == true })
     }
 }

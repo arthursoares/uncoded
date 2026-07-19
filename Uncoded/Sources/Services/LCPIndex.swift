@@ -5,6 +5,7 @@ struct LCPProfile: Identifiable, Hashable, Sendable {
     let url: URL
     let maker: String // top-level maker folder, e.g. "Voigtlander"
     let cameraMake: String? // stCamera:Make, "Leica Camera AG" for M-mount
+    let cameraModel: String? // stCamera:Model, the body the profile was measured on
     let lensPrettyName: String? // stCamera:LensPrettyName
     let profileName: String? // stCamera:ProfileName
 
@@ -39,8 +40,13 @@ enum LCPIndex {
             }
         }
 
+        // Adobe ships one .lcp per (lens, body) pair, and the Leica folder also
+        // holds Leitz Phone profiles — dedupe per lens and keep camera lenses only.
+        var seen = Set<String>()
         return files
             .compactMap { parse(url: $0.url, maker: $0.maker) }
+            .filter { $0.cameraModel?.localizedCaseInsensitiveContains("phone") != true }
+            .filter { $0.lensPrettyName.map { seen.insert($0).inserted } ?? true }
             .sorted { ($0.lensPrettyName ?? "") < ($1.lensPrettyName ?? "") }
     }
 
@@ -55,6 +61,7 @@ enum LCPIndex {
             url: url,
             maker: maker,
             cameraMake: delegate.attributes["stCamera:Make"],
+            cameraModel: delegate.attributes["stCamera:Model"],
             lensPrettyName: delegate.attributes["stCamera:LensPrettyName"],
             profileName: delegate.attributes["stCamera:ProfileName"]
         )
