@@ -57,4 +57,26 @@ enum SixBitTable {
         guard let lensModel, let id = LensNameParser.parse(lensModel) else { return nil }
         return byIdentity[id]
     }
+
+    /// Unique codes ordered by how plausible a borrow they are for the given
+    /// lens: same focal length first, then nearest aperture. People borrow the
+    /// Leica code closest to their lens's specs, so the right code should be
+    /// the first suggestion.
+    static func ranked(for identity: LensIdentity?) -> [String] {
+        guard let identity else { return uniqueCodes }
+
+        func score(_ code: String) -> Double {
+            let ids = (byCode[code] ?? []).compactMap { LensNameParser.parse($0.lensName) }
+            let scores = ids.map { id in
+                Double(abs(id.focalMM - identity.focalMM)) * 10
+                    + Double(abs(id.apertureX10 - identity.apertureX10)) / 10
+            }
+            return scores.min() ?? .greatestFiniteMagnitude
+        }
+
+        let scores = uniqueCodes.map(score)
+        return uniqueCodes.indices
+            .sorted { scores[$0] == scores[$1] ? $0 < $1 : scores[$0] < scores[$1] }
+            .map { uniqueCodes[$0] }
+    }
 }

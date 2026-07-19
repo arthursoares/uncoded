@@ -51,4 +51,19 @@ final class LensNameParserTests: XCTestCase {
     func testThirdPartyLensDoesNotMatchLeicaTable() {
         XCTAssertNil(SixBitTable.match(lensModel: "Voigtlander VM 35mm f/2 Ultron Aspherical"))
     }
+
+    func testRankedCodesSuggestMatchingSpecsFirst() {
+        // A Voigtländer 35/2 should suggest a Leica 35mm f/2 code (a Summicron
+        // 35) before anything else.
+        let identity = LensNameParser.parse("Voigtlander VM 35mm f/2 Ultron Aspherical")
+        XCTAssertNotNil(identity)
+        let first = SixBitTable.ranked(for: identity).first
+        XCTAssertNotNil(first)
+        let entries = SixBitTable.byCode[first!] ?? []
+        XCTAssertTrue(entries.contains { $0.lensName.contains("35mm f/2") },
+                      "expected a 35mm f/2 code first, got \(entries.map(\.lensName))")
+
+        // Without an identity, table order is preserved.
+        XCTAssertEqual(SixBitTable.ranked(for: nil), SixBitTable.uniqueCodes)
+    }
 }

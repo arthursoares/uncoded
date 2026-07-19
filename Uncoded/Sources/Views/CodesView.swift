@@ -169,12 +169,7 @@ private struct MapCodeSheet: View {
     }
 
     private func assign(_ lens: UserLens) {
-        let leicaName = SixBitTable.byCode[code]?.first?.lensName ?? ""
-        if let existing {
-            existing.lens = lens
-        } else {
-            context.insert(CodeMapping(code: code, leicaLensName: leicaName, lens: lens))
-        }
+        Mappings.assign(code: code, to: lens, in: context)
         dismiss()
     }
 }
