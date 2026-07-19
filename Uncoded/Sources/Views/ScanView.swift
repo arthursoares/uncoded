@@ -4,38 +4,17 @@ import SwiftData
 /// Scans a folder of DNGs, shows what each file claims vs. the truth according
 /// to the user's code mappings (plus per-frame manual overrides), and applies
 /// the fixes with the native write engine — .bak copies per Settings, undo
-/// journal always.
+/// journal always. All scan state lives in ScanSession so it survives
+/// switching sidebar tabs.
 struct ScanView: View {
-    private enum Mode: String, CaseIterable {
-        case sheet, list
-    }
-
-    /// What lens a file resolves to, and how.
-    struct Resolution {
-        let lens: UserLens?
-        let isManual: Bool
-    }
-
-    /// Per-file fix outcome for this session.
-    enum FrameFix {
-        case fixed
-        case failed(String)
-    }
+    @Bindable var session: ScanSession
 
     @Query private var mappings: [CodeMapping]
     @Query(sort: \UserLens.name) private var lenses: [UserLens]
     @AppStorage("keepBakBackups") private var keepBak = true
 
-    @State private var folder: URL?
-    @State private var results: [ScannedDNG] = []
-    @State private var scanning = false
     @State private var showPicker = false
-    @State private var mode: Mode = .sheet
-    @State private var selection = Set<URL>()
-    @State private var overrides: [URL: UserLens] = [:]
-    @State private var fixState: [URL: FrameFix] = [:]
     @State private var confirmFix = false
-    @State private var fixing = false
 
     private var mappingByCode: [String: CodeMapping] {
         Dictionary(mappings.map { ($0.code, $0) }, uniquingKeysWith: { a, _ in a })
@@ -43,15 +22,15 @@ struct ScanView: View {
 
     /// Frames that resolve to a lens and haven't been fixed yet.
     private var fixable: [(ScannedDNG, UserLens)] {
-        results.compactMap { file in
-            guard fixState[file.url] == nil, let lens = resolve(file).lens else { return nil }
+        session.results.compactMap { file in
+            guard session.fixState[file.url] == nil, let lens = resolve(file).lens else { return nil }
             return (file, lens)
         }
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            if results.isEmpty && !scanning {
+            if session.results.isEmpty && !session.scanning {
                 dropZone
             } else {
                 resultsArea
@@ -60,10 +39,10 @@ struct ScanView: View {
         .background(Theme.bg)
         .navigationTitle("Scan")
         .toolbar {
-            if !results.isEmpty {
-                Picker("View", selection: $mode) {
-                    Image(systemName: "square.grid.3x2").tag(Mode.sheet)
-                    Image(systemName: "list.bullet").tag(Mode.list)
+            if !session.results.isEmpty {
+                Picker("View", selection: $session.viewMode) {
+                    Image(systemName: "square.grid.3x2").tag(ScanViewMode.sheet)
+                    Image(systemName: "list.bullet").tag(ScanViewMode.list)
                 }
                 .pickerStyle(.segmented)
             }
@@ -77,7 +56,7 @@ struct ScanView: View {
             if case let .success(url) = result { scan(url) }
         }
         .safeAreaInset(edge: .bottom) {
-            if !selection.isEmpty { markBar }
+            if !session.selection.isEmpty { markBar }
         }
         .confirmationDialog(
             "Fix \(fixable.count) frame\(fixable.count == 1 ? "" : "s")?",
@@ -119,7 +98,7 @@ struct ScanView: View {
     private var resultsArea: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 18) {
-                if let folder {
+                if let folder = session.folder {
                     Text(folder.path)
                         .font(Theme.mono(11))
                         .foregroundStyle(Theme.dim)
@@ -127,17 +106,17 @@ struct ScanView: View {
                         .truncationMode(.head)
                 }
                 Spacer()
-                if scanning {
+                if session.scanning {
                     ProgressView().controlSize(.small)
                 } else {
-                    stat("\(results.count)", "frames")
-                    stat("\(results.filter { $0.matchedCode != nil }.count)", "coded")
-                    stat("\(results.filter { resolve($0).lens != nil }.count)", "mapped")
-                    let fixedCount = fixState.values.filter { if case .fixed = $0 { return true }; return false }.count
+                    stat("\(session.results.count)", "frames")
+                    stat("\(session.results.filter { $0.matchedCode != nil }.count)", "coded")
+                    stat("\(session.results.filter { resolve($0).lens != nil }.count)", "mapped")
+                    let fixedCount = session.fixState.values.filter { if case .fixed = $0 { return true }; return false }.count
                     if fixedCount > 0 {
                         stat("\(fixedCount)", "fixed")
                     }
-                    if fixing {
+                    if session.fixing {
                         ProgressView().controlSize(.small)
                     } else if !fixable.isEmpty {
                         Button("Fix \(fixable.count) frame\(fixable.count == 1 ? "" : "s")") {
@@ -154,21 +133,21 @@ struct ScanView: View {
 
             Divider().overlay(Theme.panelEdge)
 
-            switch mode {
+            switch session.viewMode {
             case .sheet:
-                ContactSheet(results: results,
+                ContactSheet(results: session.results,
                              resolve: resolve,
-                             fixInfo: { fixState[$0.url] },
-                             isSelected: { selection.contains($0.url) },
+                             fixInfo: { session.fixState[$0.url] },
+                             isSelected: { session.selection.contains($0.url) },
                              onTap: { toggleMark($0) },
                              onRevert: { revert($0) })
             case .list:
-                List(results) { file in
-                    ScanRow(file: file, resolution: resolve(file), fix: fixState[file.url])
+                List(session.results) { file in
+                    ScanRow(file: file, resolution: resolve(file), fix: session.fixState[file.url])
                         .listRowSeparatorTint(Theme.panelEdge)
                         .contextMenu {
                             assignMenu(for: [file.url])
-                            if case .fixed = fixState[file.url] {
+                            if case .fixed = session.fixState[file.url] {
                                 Divider()
                                 Button("Revert Fix") { revert(file) }
                             }
@@ -184,13 +163,13 @@ struct ScanView: View {
         HStack(spacing: 14) {
             HStack(spacing: 6) {
                 Circle().fill(Theme.accent).frame(width: 6, height: 6)
-                Text("\(selection.count) marked")
+                Text("\(session.selection.count) marked")
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(Theme.engraved)
             }
             Spacer()
             Menu {
-                assignMenu(for: selection)
+                assignMenu(for: session.selection)
             } label: {
                 Label("Assign Lens", systemImage: "camera.aperture")
             }
@@ -202,7 +181,7 @@ struct ScanView: View {
                     .font(.system(size: 10))
                     .foregroundStyle(Theme.faint)
             }
-            Button("Deselect") { selection = [] }
+            Button("Deselect") { session.selection = [] }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
@@ -214,11 +193,11 @@ struct ScanView: View {
         ForEach(lenses) { lens in
             Button(lens.name) { assign(lens, to: urls) }
         }
-        if urls.contains(where: { overrides[$0] != nil }) {
+        if urls.contains(where: { session.overrides[$0] != nil }) {
             Divider()
             Button("Remove manual override") {
-                for url in urls { overrides[url] = nil }
-                selection = []
+                for url in urls { session.overrides[url] = nil }
+                session.selection = []
             }
         }
     }
@@ -231,7 +210,7 @@ struct ScanView: View {
     }
 
     private func resolve(_ file: ScannedDNG) -> Resolution {
-        if let manual = overrides[file.url] {
+        if let manual = session.overrides[file.url] {
             return Resolution(lens: manual, isManual: true)
         }
         guard let code = file.matchedCode?.code, let lens = mappingByCode[code]?.lens else {
@@ -241,12 +220,12 @@ struct ScanView: View {
     }
 
     private func toggleMark(_ file: ScannedDNG) {
-        selection.formSymmetricDifference([file.url])
+        session.selection.formSymmetricDifference([file.url])
     }
 
     private func assign(_ lens: UserLens, to urls: Set<URL>) {
-        for url in urls { overrides[url] = lens }
-        selection = []
+        for url in urls { session.overrides[url] = lens }
+        session.selection = []
     }
 
     // MARK: - Fix / revert
@@ -254,7 +233,7 @@ struct ScanView: View {
     private func runFix() {
         let work = fixable.map { ($0.0.url, $0.1.lensWrite) }
         let bak = keepBak
-        fixing = true
+        session.fixing = true
         Task {
             for (url, write) in work {
                 let outcome: FrameFix = await Task.detached(priority: .userInitiated) {
@@ -265,10 +244,10 @@ struct ScanView: View {
                         return .failed(error.localizedDescription)
                     }
                 }.value
-                fixState[url] = outcome
+                session.fixState[url] = outcome
                 if case .fixed = outcome { await refresh(url) }
             }
-            fixing = false
+            session.fixing = false
         }
     }
 
@@ -283,9 +262,9 @@ struct ScanView: View {
                 }
             }.value
             if let error {
-                fixState[file.url] = .failed(error)
+                session.fixState[file.url] = .failed(error)
             } else {
-                fixState[file.url] = nil
+                session.fixState[file.url] = nil
                 await refresh(file.url)
             }
         }
@@ -298,23 +277,23 @@ struct ScanView: View {
             return ScannedDNG(url: url, meta: meta,
                               matchedCode: SixBitTable.match(lensModel: meta.lensModel))
         }.value
-        guard let updated, let index = results.firstIndex(where: { $0.url == url }) else { return }
-        results[index] = updated
+        guard let updated, let index = session.results.firstIndex(where: { $0.url == url }) else { return }
+        session.results[index] = updated
     }
 
     private func scan(_ url: URL) {
-        folder = url
-        scanning = true
-        results = []
-        selection = []
-        overrides = [:]
-        fixState = [:]
+        session.folder = url
+        session.scanning = true
+        session.results = []
+        session.selection = []
+        session.overrides = [:]
+        session.fixState = [:]
         Task {
             let found = await Task.detached(priority: .userInitiated) {
                 DNGScanner.scan(folder: url)
             }.value
-            results = found
-            scanning = false
+            session.results = found
+            session.scanning = false
         }
     }
 }
@@ -326,8 +305,8 @@ struct ScanView: View {
 /// rebate of a strip of film. Clicking a frame marks it, grease-pencil style.
 private struct ContactSheet: View {
     let results: [ScannedDNG]
-    let resolve: (ScannedDNG) -> ScanView.Resolution
-    let fixInfo: (ScannedDNG) -> ScanView.FrameFix?
+    let resolve: (ScannedDNG) -> Resolution
+    let fixInfo: (ScannedDNG) -> FrameFix?
     let isSelected: (ScannedDNG) -> Bool
     let onTap: (ScannedDNG) -> Void
     let onRevert: (ScannedDNG) -> Void
@@ -359,8 +338,8 @@ private struct ContactSheet: View {
 private struct FrameCell: View {
     let file: ScannedDNG
     let frameNumber: Int
-    let resolution: ScanView.Resolution
-    let fix: ScanView.FrameFix?
+    let resolution: Resolution
+    let fix: FrameFix?
     let selected: Bool
 
     @State private var image: NSImage?
@@ -476,8 +455,8 @@ private struct FrameCell: View {
 
 private struct ScanRow: View {
     let file: ScannedDNG
-    let resolution: ScanView.Resolution
-    let fix: ScanView.FrameFix?
+    let resolution: Resolution
+    let fix: FrameFix?
 
     var body: some View {
         HStack(spacing: 14) {

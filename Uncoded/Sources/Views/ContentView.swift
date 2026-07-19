@@ -18,6 +18,7 @@ enum SidebarItem: String, CaseIterable, Identifiable {
 
 struct ContentView: View {
     @State private var selection: SidebarItem? = .scan
+    @State private var scanSession = ScanSession()
 
     var body: some View {
         NavigationSplitView {
@@ -41,7 +42,7 @@ struct ContentView: View {
         } detail: {
             Group {
                 switch selection ?? .scan {
-                case .scan: ScanView()
+                case .scan: ScanView(session: scanSession)
                 case .lenses: LensesView()
                 case .codes: CodesView()
                 }
