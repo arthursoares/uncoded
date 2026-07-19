@@ -64,9 +64,18 @@ metadata with the truth.
 
 ## Install
 
-Grab the `.dmg` from [Releases](../../releases), drag Uncoded to
-Applications. Builds are currently **unsigned** — on first launch,
-right-click the app → *Open* → *Open*.
+Grab the `.dmg` from [Releases](../../releases) and drag Uncoded to
+Applications. Builds are currently **unsigned** (no paid Apple Developer
+account yet), so macOS warns on first launch:
+
+- **macOS 15+**: open the app once (click *Done* on the warning), then
+  **System Settings → Privacy & Security → "Uncoded" was blocked → Open
+  Anyway**. Needed only once.
+- **macOS 13/14**: right-click the app → *Open* → *Open*.
+- Terminal alternative: `xattr -d com.apple.quarantine /Applications/Uncoded.app`
+
+Every DMG is built by GitHub Actions from this repo's tagged source — the
+exact build is inspectable in the Actions tab.
 
 ## Build from source
 

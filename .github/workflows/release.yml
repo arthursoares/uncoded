@@ -29,6 +29,19 @@ jobs:
           files: dist/*.dmg
           generate_release_notes: true
           body: |
-            **Unsigned build** — on first launch, right-click Uncoded.app → *Open* → *Open*.
-
             Requires macOS 14+. The lens-profile picker needs Adobe Lightroom / Camera Raw installed.
+
+            ### Running the unsigned app
+
+            Uncoded isn't code-signed or notarized yet, so macOS will warn that it can't verify the app. It's built by GitHub Actions directly from this repository's tagged source — inspect the exact build in the Actions tab.
+
+            **macOS 15 (Sequoia) and later:**
+            1. Open the DMG and drag **Uncoded** into **Applications**.
+            2. Double-click Uncoded. macOS says it *"was not opened because it could not verify…"* — click **Done** (not *Move to Trash*).
+            3. Open **System Settings → Privacy & Security**, scroll down to *"Uncoded" was blocked…* and click **Open Anyway**, then confirm.
+
+            Needed only once; afterwards the app opens normally.
+
+            **macOS 13/14:** right-click **Uncoded.app** → **Open** → **Open**.
+
+            **Terminal alternative** (removes the quarantine flag): `xattr -d com.apple.quarantine /Applications/Uncoded.app`
