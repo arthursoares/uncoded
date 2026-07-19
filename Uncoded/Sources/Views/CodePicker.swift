@@ -5,6 +5,9 @@ import SwiftUI
 struct CodePickerList: View {
     var suggestionSeed: String
     @Binding var selection: String?
+    /// Called when the user explicitly clicks a code (as opposed to the
+    /// selection being set programmatically by a suggestion).
+    var onUserSelect: (() -> Void)? = nil
     @State private var search = ""
 
     private var ranked: [String] {
@@ -28,6 +31,7 @@ struct CodePickerList: View {
                 let entries = SixBitTable.byCode[code] ?? []
                 Button {
                     selection = selection == code ? nil : code
+                    onUserSelect?()
                 } label: {
                     VStack(alignment: .leading, spacing: 3) {
                         HStack(spacing: 10) {

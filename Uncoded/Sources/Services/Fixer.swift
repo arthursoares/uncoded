@@ -22,6 +22,21 @@ enum JournalStore {
         return url
     }
 
+    /// Paths of all files that currently have a journal on disk — used to
+    /// restore FIXED seals (and revert access) after rescans and relaunches.
+    static func fixedPaths() -> Set<String> {
+        guard let items = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        else { return [] }
+        var paths = Set<String>()
+        for url in items where url.pathExtension == "json" {
+            if let data = try? Data(contentsOf: url),
+               let journal = try? JSONDecoder().decode(WriteJournal.self, from: data) {
+                paths.insert(journal.filePath)
+            }
+        }
+        return paths
+    }
+
     /// The most recent journal recorded for a file, if any.
     static func journal(for file: URL) -> (journal: WriteJournal, url: URL)? {
         guard let items = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)

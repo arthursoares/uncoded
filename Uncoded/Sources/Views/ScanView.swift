@@ -15,6 +15,8 @@ struct ScanView: View {
 
     @State private var showPicker = false
     @State private var confirmFix = false
+    @State private var addLensCode: String?
+    @State private var codeToMap: String?
 
     private var mappingByCode: [String: CodeMapping] {
         Dictionary(mappings.map { ($0.code, $0) }, uniquingKeysWith: { a, _ in a })
@@ -26,6 +28,21 @@ struct ScanView: View {
             guard session.fixState[file.url] == nil, let lens = resolve(file).lens else { return nil }
             return (file, lens)
         }
+    }
+
+    /// Frames wearing a code that doesn't resolve to any of the user's lenses.
+    private var unclaimedCoded: [ScannedDNG] {
+        session.results.filter {
+            $0.matchedCode != nil && resolve($0).lens == nil && session.fixState[$0.url] == nil
+        }
+    }
+
+    /// The most frequent unclaimed code — the one to suggest claiming first.
+    private var topUnclaimedCode: (code: String, count: Int)? {
+        let counts = Dictionary(grouping: unclaimedCoded.compactMap { $0.matchedCode?.code }, by: { $0 })
+            .mapValues(\.count)
+        guard let best = counts.max(by: { ($0.value, $1.key) < ($1.value, $0.key) }) else { return nil }
+        return (best.key, best.value)
     }
 
     var body: some View {
@@ -65,9 +82,16 @@ struct ScanView: View {
             Button("Rewrite Metadata") { runFix() }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text(keepBak
+            Text((keepBak
                 ? "Lens metadata is rewritten in place. A one-time .bak copy is kept next to each file, and every fix records an undo journal."
                 : "Lens metadata is rewritten in place. No .bak copies (per Settings) — every fix still records an undo journal.")
+                + " Photos already in a Lightroom catalog need Metadata → Read Metadata from File afterwards; photos imported after fixing just work.")
+        }
+        .sheet(item: $addLensCode) { code in
+            AddLensSheet(preselectedCode: code)
+        }
+        .sheet(item: $codeToMap) { code in
+            MapCodeSheet(code: code, existing: mappingByCode[code])
         }
     }
 
@@ -131,6 +155,10 @@ struct ScanView: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
 
+            if !session.scanning, let top = topUnclaimedCode {
+                unclaimedBanner(top)
+            }
+
             Divider().overlay(Theme.panelEdge)
 
             switch session.viewMode {
@@ -140,7 +168,8 @@ struct ScanView: View {
                              fixInfo: { session.fixState[$0.url] },
                              isSelected: { session.selection.contains($0.url) },
                              onTap: { toggleMark($0) },
-                             onRevert: { revert($0) })
+                             onRevert: { revert($0) },
+                             onMapCode: { codeToMap = $0 })
             case .list:
                 List(session.results) { file in
                     ScanRow(file: file, resolution: resolve(file), fix: session.fixState[file.url])
@@ -156,6 +185,29 @@ struct ScanView: View {
                 .scrollContentBackground(.hidden)
             }
         }
+    }
+
+    /// The road out of the "0 mapped" dead end: an unclaimed code with a
+    /// direct route to claiming it.
+    private func unclaimedBanner(_ top: (code: String, count: Int)) -> some View {
+        HStack(spacing: 10) {
+            BitPatternView(code: top.code, dotSize: 7)
+            Text("\(top.count) frame\(top.count == 1 ? "" : "s") wear\(top.count == 1 ? "s" : "") code \(top.code) — not claimed by any of your lenses yet")
+                .font(.system(size: 11))
+                .foregroundStyle(Theme.rebate)
+            Spacer()
+            if !lenses.isEmpty {
+                Button("Map to a Lens…") { codeToMap = top.code }
+                    .controlSize(.small)
+            }
+            Button("Add Lens…") { addLensCode = top.code }
+                .controlSize(.small)
+                .buttonStyle(.borderedProminent)
+                .tint(Theme.accent)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(Theme.rebate.opacity(0.08))
     }
 
     /// Grease-pencil action bar for the marked frames.
@@ -289,10 +341,15 @@ struct ScanView: View {
         session.overrides = [:]
         session.fixState = [:]
         Task {
-            let found = await Task.detached(priority: .userInitiated) {
-                DNGScanner.scan(folder: url)
+            let (found, journaled) = await Task.detached(priority: .userInitiated) {
+                (DNGScanner.scan(folder: url), JournalStore.fixedPaths())
             }.value
             session.results = found
+            // Files with a persisted journal were fixed in an earlier session —
+            // restore their FIXED seals so revert stays reachable.
+            for file in found where journaled.contains(file.url.path) {
+                session.fixState[file.url] = .fixed
+            }
             session.scanning = false
         }
     }
@@ -310,6 +367,7 @@ private struct ContactSheet: View {
     let isSelected: (ScannedDNG) -> Bool
     let onTap: (ScannedDNG) -> Void
     let onRevert: (ScannedDNG) -> Void
+    let onMapCode: (String) -> Void
 
     var body: some View {
         ScrollView {
@@ -325,6 +383,8 @@ private struct ContactSheet: View {
                         .contextMenu {
                             if case .fixed = fixInfo(file) {
                                 Button("Revert Fix") { onRevert(file) }
+                            } else if let code = file.matchedCode?.code, resolve(file).lens == nil {
+                                Button("Map Code \(code) to a Lens…") { onMapCode(code) }
                             }
                         }
                 }

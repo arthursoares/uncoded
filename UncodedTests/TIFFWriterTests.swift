@@ -117,6 +117,38 @@ final class TIFFWriterTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: url), original, "revert must be byte-perfect")
     }
 
+    func testRevertRefusesWhenFileChangedSinceFix() throws {
+        let original = makeTIFF(xmp: sampleXMP)
+        let url = try writeTemp(original)
+        let journal = try TIFFWriter.apply(voigtlander, to: url)
+
+        // Simulate Lightroom (or anything else) touching the file after the
+        // fix: flip one byte inside a patched region.
+        var tampered = try Data(contentsOf: url)
+        let offset = journal.patches[0].offset
+        tampered[offset] ^= 0xFF
+        try tampered.write(to: url)
+
+        XCTAssertThrowsError(try TIFFWriter.revert(journal)) { error in
+            guard case TIFFWriteError.fileChangedSinceFix = error else {
+                return XCTFail("expected fileChangedSinceFix, got \(error)")
+            }
+        }
+        XCTAssertEqual(try Data(contentsOf: url), tampered,
+                       "a refused revert must not touch the file")
+    }
+
+    func testRevertRefusesWhenFileLengthChanged() throws {
+        let url = try writeTemp(makeTIFF(xmp: sampleXMP))
+        let journal = try TIFFWriter.apply(voigtlander, to: url)
+
+        var grown = try Data(contentsOf: url)
+        grown.append(Data("extra".utf8))
+        try grown.write(to: url)
+
+        XCTAssertThrowsError(try TIFFWriter.revert(journal))
+    }
+
     func testDryRunTouchesNothing() throws {
         let original = makeTIFF(xmp: sampleXMP)
         let url = try writeTemp(original)

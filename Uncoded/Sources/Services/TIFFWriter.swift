@@ -31,11 +31,14 @@ struct WriteJournal: Codable {
 enum TIFFWriteError: Error, LocalizedError {
     case missingTag(String)
     case corruptStructure
+    case fileChangedSinceFix
 
     var errorDescription: String? {
         switch self {
         case .missingTag(let tag): return "File has no \(tag) field to update"
         case .corruptStructure: return "File structure not understood; refusing to write"
+        case .fileChangedSinceFix:
+            return "This file changed since Uncoded fixed it — reverting would damage it. Restore the .bak copy instead."
         }
     }
 }
@@ -81,9 +84,24 @@ struct TIFFWriter {
         return journal
     }
 
-    /// Restores a file to its pre-write state using the journal.
+    /// Restores a file to its pre-write state using the journal — but only
+    /// after verifying the file is exactly as the write left it. If anything
+    /// else touched the file since (Lightroom saving metadata, a re-fix, a
+    /// different file at the same path), patching stale offsets would corrupt
+    /// it, so we refuse instead.
     static func revert(_ journal: WriteJournal) throws {
         let url = URL(fileURLWithPath: journal.filePath)
+        let data = try Data(contentsOf: url, options: .alwaysMapped)
+        guard data.count == journal.originalLength + journal.appendedBytes else {
+            throw TIFFWriteError.fileChangedSinceFix
+        }
+        for patch in journal.patches {
+            let end = patch.offset + patch.new.count
+            guard end <= data.count, data.subdata(in: patch.offset..<end) == patch.new else {
+                throw TIFFWriteError.fileChangedSinceFix
+            }
+        }
+
         let handle = try FileHandle(forWritingTo: url)
         defer { try? handle.close() }
         for patch in journal.patches {

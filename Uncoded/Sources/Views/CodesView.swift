@@ -95,7 +95,8 @@ private struct CodeCard: View {
 }
 
 /// Assigns (or clears) the user's real lens for a borrowed code.
-private struct MapCodeSheet: View {
+/// Also presented from the Scan tab when an unclaimed code is detected.
+struct MapCodeSheet: View {
     let code: String
     let existing: CodeMapping?
 

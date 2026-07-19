@@ -91,6 +91,20 @@ final class FixerTests: XCTestCase {
                        "second fix must not clobber the pristine backup")
     }
 
+    func testFixedPathsListsJournaledFiles() throws {
+        let a = tempDir.appendingPathComponent("a.dng")
+        let b = tempDir.appendingPathComponent("b.dng")
+        try makeTIFF().write(to: a)
+        try makeTIFF().write(to: b)
+
+        XCTAssertTrue(JournalStore.fixedPaths().isEmpty)
+        try Fixer.fix(file: a, with: write, keepBak: false)
+        XCTAssertEqual(JournalStore.fixedPaths(), [a.path])
+
+        try Fixer.revert(file: a)
+        XCTAssertTrue(JournalStore.fixedPaths().isEmpty, "revert consumes the journal")
+    }
+
     func testRevertWithoutJournalThrows() {
         let file = tempDir.appendingPathComponent("never-fixed.dng")
         XCTAssertThrowsError(try Fixer.revert(file: file))

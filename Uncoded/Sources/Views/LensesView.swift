@@ -121,7 +121,11 @@ private struct LensCard: View {
 
 /// One-step lens creation: pick the lens (left, from the local Adobe profile
 /// index) and the 6-bit code it wears (right, best suggestion first).
-private struct AddLensSheet: View {
+/// `preselectedCode` seeds the code side (used when arriving from a scan
+/// that found an unclaimed code) and is treated as the user's own choice.
+struct AddLensSheet: View {
+    var preselectedCode: String? = nil
+
     @Environment(\.modelContext) private var context
     @Environment(\.dismiss) private var dismiss
 
@@ -136,6 +140,7 @@ private struct AddLensSheet: View {
     @State private var profileName = ""
     @State private var profileFilename = ""
     @State private var selectedCode: String?
+    @State private var codeAutoSelected = true
 
     private var filtered: [LCPProfile] {
         guard !search.isEmpty else { return profiles }
@@ -214,7 +219,8 @@ private struct AddLensSheet: View {
                 // Right: which code is engraved on it?
                 VStack(alignment: .leading, spacing: 8) {
                     EngravedLabel("coded as", color: Theme.faint)
-                    CodePickerList(suggestionSeed: name, selection: $selectedCode)
+                    CodePickerList(suggestionSeed: name, selection: $selectedCode,
+                                   onUserSelect: { codeAutoSelected = false })
                 }
                 .frame(width: 340)
             }
@@ -236,6 +242,12 @@ private struct AddLensSheet: View {
         .frame(minWidth: 800, minHeight: 560)
         .background(Theme.bg)
         .preferredColorScheme(.dark)
+        .onAppear {
+            if let preselectedCode, selectedCode == nil {
+                selectedCode = preselectedCode
+                codeAutoSelected = false
+            }
+        }
         .task {
             let found = await Task.detached(priority: .userInitiated) {
                 LCPIndex.indexMMount()
@@ -255,8 +267,9 @@ private struct AddLensSheet: View {
             focalLength = "\(id.focalMM).0mm"
             let ap = Double(id.apertureX10) / 10
             aperture = ap == ap.rounded() ? "f/\(Int(ap))" : "f/\(ap)"
-            // Preselect the most plausible borrowed code for these specs.
-            if selectedCode == nil {
+            // Re-suggest the most plausible borrowed code for the new specs —
+            // but never override a code the user picked themselves.
+            if codeAutoSelected {
                 selectedCode = SixBitTable.ranked(for: id).first
             }
         }
