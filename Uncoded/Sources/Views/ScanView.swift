@@ -2,19 +2,30 @@ import SwiftUI
 import SwiftData
 
 /// Scans a folder of DNGs and shows what each file claims vs. the truth
-/// according to the user's code mappings. Read-only for now.
+/// according to the user's code mappings. Frames can be marked (like a
+/// contact sheet) and manually assigned a lens, overriding the code mapping.
+/// Read-only for now.
 struct ScanView: View {
     private enum Mode: String, CaseIterable {
         case sheet, list
     }
 
+    /// What lens a file resolves to, and how.
+    struct Resolution {
+        let lens: UserLens?
+        let isManual: Bool
+    }
+
     @Query private var mappings: [CodeMapping]
+    @Query(sort: \UserLens.name) private var lenses: [UserLens]
 
     @State private var folder: URL?
     @State private var results: [ScannedDNG] = []
     @State private var scanning = false
     @State private var showPicker = false
     @State private var mode: Mode = .sheet
+    @State private var selection = Set<URL>()
+    @State private var overrides: [URL: UserLens] = [:]
 
     private var mappingByCode: [String: CodeMapping] {
         Dictionary(mappings.map { ($0.code, $0) }, uniquingKeysWith: { a, _ in a })
@@ -46,6 +57,9 @@ struct ScanView: View {
         }
         .fileImporter(isPresented: $showPicker, allowedContentTypes: [.folder]) { result in
             if case let .success(url) = result { scan(url) }
+        }
+        .safeAreaInset(edge: .bottom) {
+            if !selection.isEmpty { markBar }
         }
     }
 
@@ -89,7 +103,7 @@ struct ScanView: View {
                 } else {
                     stat("\(results.count)", "frames")
                     stat("\(results.filter { $0.matchedCode != nil }.count)", "coded")
-                    stat("\(results.filter { mapped($0) != nil }.count)", "mapped")
+                    stat("\(results.filter { resolve($0).lens != nil }.count)", "mapped")
                 }
             }
             .padding(.horizontal, 16)
@@ -99,13 +113,61 @@ struct ScanView: View {
 
             switch mode {
             case .sheet:
-                ContactSheet(results: results, realLens: mapped)
+                ContactSheet(results: results,
+                             resolve: resolve,
+                             isSelected: { selection.contains($0.url) },
+                             onTap: { toggleMark($0) })
             case .list:
                 List(results) { file in
-                    ScanRow(file: file, realLens: mapped(file))
+                    ScanRow(file: file, resolution: resolve(file))
                         .listRowSeparatorTint(Theme.panelEdge)
+                        .contextMenu { assignMenu(for: [file.url]) }
                 }
                 .scrollContentBackground(.hidden)
+            }
+        }
+    }
+
+    /// Grease-pencil action bar for the marked frames.
+    private var markBar: some View {
+        HStack(spacing: 14) {
+            HStack(spacing: 6) {
+                Circle().fill(Theme.accent).frame(width: 6, height: 6)
+                Text("\(selection.count) marked")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Theme.engraved)
+            }
+            Spacer()
+            Menu {
+                assignMenu(for: selection)
+            } label: {
+                Label("Assign Lens", systemImage: "camera.aperture")
+            }
+            .menuStyle(.borderedButton)
+            .fixedSize()
+            .disabled(lenses.isEmpty)
+            if lenses.isEmpty {
+                Text("add lenses under “My Lenses” first")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.faint)
+            }
+            Button("Deselect") { selection = [] }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.bar)
+    }
+
+    @ViewBuilder
+    private func assignMenu(for urls: Set<URL>) -> some View {
+        ForEach(lenses) { lens in
+            Button(lens.name) { assign(lens, to: urls) }
+        }
+        if urls.contains(where: { overrides[$0] != nil }) {
+            Divider()
+            Button("Remove manual override") {
+                for url in urls { overrides[url] = nil }
+                selection = []
             }
         }
     }
@@ -117,15 +179,31 @@ struct ScanView: View {
         }
     }
 
-    private func mapped(_ file: ScannedDNG) -> UserLens? {
-        guard let code = file.matchedCode?.code else { return nil }
-        return mappingByCode[code]?.lens
+    private func resolve(_ file: ScannedDNG) -> Resolution {
+        if let manual = overrides[file.url] {
+            return Resolution(lens: manual, isManual: true)
+        }
+        guard let code = file.matchedCode?.code, let lens = mappingByCode[code]?.lens else {
+            return Resolution(lens: nil, isManual: false)
+        }
+        return Resolution(lens: lens, isManual: false)
+    }
+
+    private func toggleMark(_ file: ScannedDNG) {
+        selection.formSymmetricDifference([file.url])
+    }
+
+    private func assign(_ lens: UserLens, to urls: Set<URL>) {
+        for url in urls { overrides[url] = lens }
+        selection = []
     }
 
     private func scan(_ url: URL) {
         folder = url
         scanning = true
         results = []
+        selection = []
+        overrides = [:]
         Task {
             let found = await Task.detached(priority: .userInitiated) {
                 DNGScanner.scan(folder: url)
@@ -140,17 +218,23 @@ struct ScanView: View {
 
 /// The scan as a film contact sheet: black frames on a dark ground, with the
 /// filename and code printed beneath each frame like edge markings on the
-/// rebate of a strip of film.
+/// rebate of a strip of film. Clicking a frame marks it, grease-pencil style.
 private struct ContactSheet: View {
     let results: [ScannedDNG]
-    let realLens: (ScannedDNG) -> UserLens?
+    let resolve: (ScannedDNG) -> ScanView.Resolution
+    let isSelected: (ScannedDNG) -> Bool
+    let onTap: (ScannedDNG) -> Void
 
     var body: some View {
         ScrollView {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 178, maximum: 260), spacing: 14)],
                       spacing: 16) {
                 ForEach(Array(results.enumerated()), id: \.element.id) { index, file in
-                    FrameCell(file: file, frameNumber: index + 1, realLens: realLens(file))
+                    FrameCell(file: file,
+                              frameNumber: index + 1,
+                              resolution: resolve(file),
+                              selected: isSelected(file))
+                        .onTapGesture { onTap(file) }
                 }
             }
             .padding(16)
@@ -162,7 +246,8 @@ private struct ContactSheet: View {
 private struct FrameCell: View {
     let file: ScannedDNG
     let frameNumber: Int
-    let realLens: UserLens?
+    let resolution: ScanView.Resolution
+    let selected: Bool
 
     @State private var image: NSImage?
 
@@ -188,7 +273,11 @@ private struct FrameCell: View {
                 HStack(spacing: 6) {
                     Text(String(format: "%02d", frameNumber))
                         .font(Theme.mono(9))
-                        .foregroundStyle(Theme.rebate)
+                        .foregroundStyle(selected ? Theme.engraved : Theme.rebate)
+                        .padding(.horizontal, selected ? 4 : 0)
+                        .background(
+                            Capsule().stroke(Theme.accent, lineWidth: selected ? 1.5 : 0)
+                        )
                     Text(file.filename)
                         .font(Theme.mono(9))
                         .foregroundStyle(Theme.rebate.opacity(0.8))
@@ -201,14 +290,17 @@ private struct FrameCell: View {
                 }
 
                 HStack(spacing: 4) {
-                    if let realLens {
+                    if let lens = resolution.lens {
                         Image(systemName: "arrow.turn.down.right")
                             .font(.system(size: 7))
                             .foregroundStyle(Theme.ok)
-                        Text(realLens.name)
+                        Text(lens.name)
                             .font(.system(size: 9, weight: .medium))
                             .foregroundStyle(Theme.ok)
                             .lineLimit(1)
+                        if resolution.isManual {
+                            EngravedLabel("manual", color: Theme.rebate)
+                        }
                     } else if file.matchedCode != nil {
                         Text("code not mapped")
                             .font(.system(size: 9))
@@ -225,7 +317,11 @@ private struct FrameCell: View {
             .padding(.vertical, 6)
             .background(Color.black)
         }
-        .overlay(Rectangle().strokeBorder(Theme.panelEdge.opacity(0.6), lineWidth: 1))
+        .overlay(
+            Rectangle().strokeBorder(selected ? Theme.accent : Theme.panelEdge.opacity(0.6),
+                                     lineWidth: selected ? 2 : 1)
+        )
+        .contentShape(Rectangle())
         .help(helpText)
         .task { image = await ThumbnailLoader.thumbnail(for: file.url) }
     }
@@ -234,7 +330,9 @@ private struct FrameCell: View {
         var lines = [file.filename]
         if let claimed = file.claimedLens { lines.append("claims: \(claimed)") }
         if let code = file.matchedCode { lines.append("code \(code.code) — \(code.lensName)") }
-        if let realLens { lines.append("actually: \(realLens.name)") }
+        if let lens = resolution.lens {
+            lines.append("actually: \(lens.name)\(resolution.isManual ? " (manual)" : "")")
+        }
         return lines.joined(separator: "\n")
     }
 }
@@ -243,7 +341,7 @@ private struct FrameCell: View {
 
 private struct ScanRow: View {
     let file: ScannedDNG
-    let realLens: UserLens?
+    let resolution: ScanView.Resolution
 
     var body: some View {
         HStack(spacing: 14) {
@@ -265,15 +363,18 @@ private struct ScanRow: View {
                     .foregroundStyle(file.claimedLens == nil ? Theme.faint : Theme.dim)
                     .lineLimit(1)
 
-                if let realLens {
+                if let lens = resolution.lens {
                     HStack(spacing: 5) {
                         Image(systemName: "arrow.turn.down.right")
                             .font(.system(size: 8))
                             .foregroundStyle(Theme.ok)
-                        Text(realLens.name)
+                        Text(lens.name)
                             .font(.system(size: 11, weight: .medium))
                             .foregroundStyle(Theme.ok)
                             .lineLimit(1)
+                        if resolution.isManual {
+                            EngravedLabel("manual", color: Theme.rebate)
+                        }
                     }
                 } else if file.matchedCode != nil {
                     Text("code not mapped to one of your lenses")
