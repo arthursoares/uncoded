@@ -32,31 +32,32 @@ struct CodePickerList: View {
                 Button {
                     selection = selection == code ? nil : code
                 } label: {
-                    HStack(spacing: 10) {
-                        BitPatternView(code: code, dotSize: 8)
-                        Text(code)
-                            .font(Theme.mono(11))
-                            .foregroundStyle(Theme.engraved)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(entries.first?.lensName ?? "")
-                                .font(.system(size: 11))
-                                .foregroundStyle(Theme.dim)
-                                .lineLimit(1)
-                            if entries.count > 1 {
-                                Text("+ \(entries.count - 1) generation\(entries.count > 2 ? "s" : "")")
-                                    .font(.system(size: 9))
-                                    .foregroundStyle(Theme.faint)
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 10) {
+                            BitPatternView(code: code, dotSize: 8)
+                            Text(code)
+                                .font(Theme.mono(11))
+                                .foregroundStyle(Theme.engraved)
+                            Spacer()
+                            if index == 0 && hasSuggestion && selection != code {
+                                EngravedLabel("suggested", color: Theme.faint)
+                            }
+                            if selection == code {
+                                Image(systemName: "checkmark")
+                                    .foregroundStyle(Theme.accent)
                             }
                         }
-                        Spacer()
-                        if index == 0 && hasSuggestion && selection != code {
-                            EngravedLabel("suggested", color: Theme.faint)
-                        }
-                        if selection == code {
-                            Image(systemName: "checkmark")
-                                .foregroundStyle(Theme.accent)
+                        Text(entries.first?.lensName ?? "")
+                            .font(.system(size: 11))
+                            .foregroundStyle(Theme.dim)
+                            .fixedSize(horizontal: false, vertical: true)
+                        if entries.count > 1 {
+                            Text("+ \(entries.count - 1) generation\(entries.count > 2 ? "s" : "")")
+                                .font(.system(size: 9))
+                                .foregroundStyle(Theme.faint)
                         }
                     }
+                    .padding(.vertical, 2)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)

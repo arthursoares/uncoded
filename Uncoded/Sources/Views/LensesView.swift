@@ -219,7 +219,7 @@ private struct AddLensSheet: View {
                     EngravedLabel("coded as", color: Theme.faint)
                     CodePickerList(suggestionSeed: name, selection: $selectedCode)
                 }
-                .frame(width: 300)
+                .frame(width: 340)
             }
 
             HStack {
@@ -236,7 +236,7 @@ private struct AddLensSheet: View {
             }
         }
         .padding(20)
-        .frame(minWidth: 760, minHeight: 560)
+        .frame(minWidth: 800, minHeight: 560)
         .background(Theme.bg)
         .preferredColorScheme(.dark)
         .task {
