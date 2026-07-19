@@ -64,6 +64,5 @@ Successor to the `fix_6bit_exif` CLI.
 
 ## Pending / known state
 
-- Repo is private; LICENSE not yet chosen — both must be resolved before
-  sharing `docs/announcing-uncoded.md`.
+- Repo is public, GPL-3.0. Announcement drafts: `docs/announcing-uncoded.md`.
 - v0.2 backlog lives in `docs/design-review-2026-07.md` (P1/P2 sections).
