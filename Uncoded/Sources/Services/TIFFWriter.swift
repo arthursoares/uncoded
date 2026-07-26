@@ -20,12 +20,76 @@ struct WritePatch: Codable {
 
 /// Everything needed to undo a write: restore the patched bytes and truncate
 /// away whatever was appended at end-of-file.
+///
+/// The patches double as a content fingerprint: `originalLength`, the offsets
+/// and the before/after bytes together identify the file this journal belongs
+/// to without hashing a 100 MB raw, which is how a fixed file that was renamed
+/// after the fix is still recognised.
 struct WriteJournal: Codable {
     let filePath: String
     let date: Date
     let originalLength: Int
     let patches: [WritePatch]
     let appendedBytes: Int
+    // Added in v0.2. Optional, so journals written by v0.1.x still decode —
+    // and so v0.1.x still decodes these (it ignores the extra keys).
+    var originalFileName: String?
+    var state: State?
+    var bak: BakRecord?
+
+    /// A journal is written before the bytes change, so a record on disk does
+    /// not by itself mean the write happened.
+    enum State: String, Codable {
+        case pending
+        case committed
+    }
+
+    /// Identity of the .bak Uncoded made, so a later fix can tell its own
+    /// pristine backup from a stale or foreign one.
+    struct BakRecord: Codable {
+        let size: Int
+        let modified: Date
+
+        /// Modification dates survive a JSON round-trip as floating point;
+        /// second granularity is all the identity check needs.
+        func matches(_ other: BakRecord) -> Bool {
+            size == other.size && abs(modified.timeIntervalSince(other.modified)) < 1
+        }
+    }
+
+    /// v0.1.x journals were saved only after a successful write.
+    var isCommitted: Bool { (state ?? .committed) == .committed }
+
+    var fileName: String { originalFileName ?? URL(fileURLWithPath: filePath).lastPathComponent }
+
+    /// Length the file has once the write has landed.
+    var writtenLength: Int { originalLength + appendedBytes }
+
+    /// True when `data` is exactly what this write leaves behind.
+    func describesWrittenBytes(_ data: Data) -> Bool {
+        guard originalLength >= 0, appendedBytes >= 0, !patches.isEmpty,
+              data.count == writtenLength else { return false }
+        return patches.allSatisfy { holds($0.new, at: $0.offset, in: data) }
+    }
+
+    /// True when `data` is still the pre-write file — the write never landed.
+    func describesOriginalBytes(_ data: Data) -> Bool {
+        guard originalLength >= 0, !patches.isEmpty, data.count == originalLength else { return false }
+        return patches.allSatisfy { holds($0.original, at: $0.offset, in: data) }
+    }
+
+    private func holds(_ bytes: Data, at offset: Int, in data: Data) -> Bool {
+        guard offset >= 0, !bytes.isEmpty, offset <= data.count - bytes.count else { return false }
+        return data.subdata(in: offset..<(offset + bytes.count)) == bytes
+    }
+
+    /// The same write, recorded against a file that has moved since.
+    func relocated(to url: URL) -> WriteJournal {
+        guard url.path != filePath else { return self }
+        return WriteJournal(filePath: url.path, date: date, originalLength: originalLength,
+                            patches: patches, appendedBytes: appendedBytes,
+                            originalFileName: fileName, state: state, bak: bak)
+    }
 }
 
 enum TIFFWriteError: Error, LocalizedError {
@@ -99,18 +163,34 @@ struct TIFFWriter {
         self.layout = try TIFFReader(data: data).structure()
     }
 
+    /// A planned write: nothing on disk has been touched, but the journal that
+    /// describes the change already exists. Splitting the two lets the caller
+    /// persist the undo record *before* the bytes move.
+    struct Prepared {
+        let journal: WriteJournal
+        fileprivate let writer: TIFFWriter
+        fileprivate let url: URL
+
+        func commit() throws { try writer.commit(to: url) }
+    }
+
+    /// Plans the write and returns it with its journal, unapplied.
+    static func prepare(_ write: LensWrite, to url: URL) throws -> Prepared {
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
+        var writer = try TIFFWriter(data: data)
+        try writer.plan(write)
+        return Prepared(journal: writer.journal(for: url), writer: writer, url: url)
+    }
+
     /// Applies the write to the file on disk and returns the journal.
     /// With `dryRun` the file is untouched and the journal describes what
     /// would change.
     static func apply(_ write: LensWrite, to url: URL, dryRun: Bool = false) throws -> WriteJournal {
-        let data = try Data(contentsOf: url, options: .mappedIfSafe)
-        var writer = try TIFFWriter(data: data)
-        try writer.plan(write)
-        let journal = writer.journal(for: url)
+        let prepared = try prepare(write, to: url)
         if !dryRun {
-            try writer.commit(to: url)
+            try prepared.commit()
         }
-        return journal
+        return prepared.journal
     }
 
     /// Restores a file to its pre-write state using the journal — but only
@@ -514,7 +594,9 @@ struct TIFFWriter {
         }
         return WriteJournal(filePath: url.path, date: Date(),
                             originalLength: originalLength,
-                            patches: recorded, appendedBytes: appendix.count)
+                            patches: recorded, appendedBytes: appendix.count,
+                            originalFileName: url.lastPathComponent,
+                            state: .pending)
     }
 
     /// Write ordering is the whole safety story here: a crash or a full disk
