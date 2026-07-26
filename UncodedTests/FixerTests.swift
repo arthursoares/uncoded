@@ -261,6 +261,75 @@ final class FixerTests: XCTestCase {
                        "the dead appendix must not survive as trailing junk")
     }
 
+    /// A commit that died part way through its patch loop: appendix written,
+    /// then the first `applied` patches, then nothing.
+    private func simulateInterruptedPatches(_ file: URL, applying applied: Int) throws -> JournalRecord {
+        let prepared = try TIFFWriter.prepare(write, to: file)
+        XCTAssertGreaterThan(prepared.journal.patches.count, applied,
+                             "fixture must have more patches than we apply")
+        let record = try store.save(prepared.journal)
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data(repeating: 0, count: prepared.journal.appendedBytes))
+        for patch in prepared.journal.patches.prefix(applied) {
+            try handle.seek(toOffset: UInt64(patch.offset))
+            try handle.write(contentsOf: patch.new)
+        }
+        try handle.close()
+        return record
+    }
+
+    func testHalfWrittenPatchesAreNotAFixAndAreRecovered() throws {
+        let file = tempDir.appendingPathComponent("photo.dng")
+        let original = makeTIFF()
+        try original.write(to: file)
+        let record = try simulateInterruptedPatches(file, applying: 1)
+
+        XCTAssertEqual(store.resolve(record), .interrupted)
+        XCTAssertTrue(store.fixedPaths().isEmpty, "a half-written file must not read as fixed")
+        XCTAssertEqual(journalFiles().count, 1, "and the read path must not delete the record")
+
+        try fixer.fix(file: file, with: write, keepBak: false)
+        XCTAssertEqual(journalFiles().count, 1)
+        try fixer.revert(file: file)
+        XCTAssertEqual(try Data(contentsOf: file), original,
+                       "the half-written bytes must be rolled back, not built on")
+    }
+
+    func testHalfWrittenPatchesAreRecoveredByRevert() throws {
+        let file = tempDir.appendingPathComponent("photo.dng")
+        let original = makeTIFF()
+        try original.write(to: file)
+        _ = try simulateInterruptedPatches(file, applying: 1)
+
+        try fixer.revert(file: file)
+        XCTAssertEqual(try Data(contentsOf: file), original)
+        XCTAssertTrue(journalFiles().isEmpty)
+    }
+
+    func testAFileEditedAfterAHalfWrittenFixIsRefused() throws {
+        let file = tempDir.appendingPathComponent("photo.dng")
+        try makeTIFF().write(to: file)
+        let record = try simulateInterruptedPatches(file, applying: 1)
+
+        // Something else writes inside a patched region: bytes from neither
+        // state, so nothing here may be forced back.
+        let patch = record.journal.patches[record.journal.patches.count - 1]
+        let foreign = (UInt8(0)...UInt8(255)).first {
+            $0 != patch.original.first! && $0 != patch.new.first!
+        }!
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.seek(toOffset: UInt64(patch.offset))
+        try handle.write(contentsOf: Data([foreign]))
+        try handle.close()
+        let edited = try Data(contentsOf: file)
+
+        XCTAssertEqual(store.resolve(record), .unverified)
+        XCTAssertEqual(store.fixedPaths(), [file.path], "unknown state keeps revert reachable")
+        XCTAssertThrowsError(try fixer.revert(file: file))
+        XCTAssertEqual(try Data(contentsOf: file), edited, "a file we didn't make must not be forced")
+    }
+
     func testInterruptedAppendixIsRecoveredByRevert() throws {
         let file = tempDir.appendingPathComponent("photo.dng")
         let original = makeTIFF()
@@ -342,6 +411,48 @@ final class FixerTests: XCTestCase {
         try fixer.revert(file: renamed)
         XCTAssertEqual(try Data(contentsOf: renamed), originalB)
         XCTAssertEqual(store.fixedPaths(), [a.path])
+    }
+
+    // MARK: - Sealing a scan
+
+    func testSealedURLsSealsARenamedFixedFile() throws {
+        let file = tempDir.appendingPathComponent("photo.dng")
+        try makeTIFF().write(to: file)
+        try fixer.fix(file: file, with: write, keepBak: false)
+
+        let renamed = tempDir.appendingPathComponent("2026-07-26-0001.dng")
+        try FileManager.default.moveItem(at: file, to: renamed)
+
+        let result = store.sealedURLs(in: [renamed])
+        XCTAssertEqual(result.sealed, [renamed], "a renamed frame keeps its seal")
+        XCTAssertEqual(result.renamedFrom[renamed], "photo.dng")
+    }
+
+    func testSealedURLsDoesNotSealACopyWhileTheOriginalExists() throws {
+        let a = tempDir.appendingPathComponent("a.dng")
+        try makeTIFF().write(to: a)
+        try fixer.fix(file: a, with: write, keepBak: false)
+        let b = tempDir.appendingPathComponent("b.dng")
+        try FileManager.default.copyItem(at: a, to: b)
+
+        let result = store.sealedURLs(in: [a, b])
+        XCTAssertEqual(result.sealed, [a], "the copy has no undo record of its own")
+        XCTAssertTrue(result.renamedFrom.isEmpty)
+    }
+
+    func testSealedURLsSealsNeitherOfTwoFilesClaimingOneJournal() throws {
+        let file = tempDir.appendingPathComponent("photo.dng")
+        try makeTIFF().write(to: file)
+        try fixer.fix(file: file, with: write, keepBak: false)
+
+        // The fixed frame renamed, and a copy of it alongside: one journal,
+        // two claimants, no honest seal.
+        let one = tempDir.appendingPathComponent("one.dng")
+        let two = tempDir.appendingPathComponent("two.dng")
+        try FileManager.default.moveItem(at: file, to: one)
+        try FileManager.default.copyItem(at: one, to: two)
+
+        XCTAssertTrue(store.sealedURLs(in: [one, two]).sealed.isEmpty)
     }
 
     func testRevertReportsAJournalItCannotDelete() throws {

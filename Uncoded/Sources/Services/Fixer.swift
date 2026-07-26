@@ -90,18 +90,48 @@ struct JournalStore: Sendable {
     }
 
     /// What a stored journal means for the file it names.
+    ///
+    /// A commit writes the appendix, flushes, writes the value patches,
+    /// flushes, then writes the pointer patches — so an interrupted one leaves
+    /// the file in one of a handful of states, and the journal (which holds
+    /// every region's bytes before *and* after) can tell which:
+    ///
+    ///     length \ patched regions   all pre-write   all post-write   mixed
+    ///     originalLength             abandoned       interrupted¹     interrupted
+    ///     writtenLength              appendix only²  landed           interrupted
+    ///     anything else              unverified      unverified       unverified
+    ///
+    /// Any region holding bytes from neither state ⇒ unverified, whatever the
+    /// length: something other than us wrote there and only the user knows
+    /// what it was. `unverified` is also where an unreadable file lands.
+    ///
+    /// The three interrupted states are recoverable *because* every region is
+    /// provably one of ours: restoring the pre-write bytes and truncating to
+    /// `originalLength` puts the file back where it started. Only pending
+    /// journals are audited at all — a committed one plus a mixed file is not
+    /// an interrupted write, it is a file edited after the fix.
+    ///
+    /// ¹ patches without the appendix that was written first: pathological, but
+    ///   the fields would point past end-of-file, so recover rather than seal.
+    /// ² the appendix landed and no patch did.
     enum Resolution: Equatable {
         /// The write is on disk (or the journal predates the pending split).
         case landed
         /// The journal describes a write that never reached the file.
         case abandoned
-        /// The appendix reached end-of-file but none of the patches did: the
-        /// write died between its first and second step. The file is unfixed
-        /// with dead bytes glued on, and only a truncation puts it right.
+        /// The appendix reached end-of-file but none of the patches did.
         case abandonedWithAppendix
-        /// The file is gone, unreadable, or in neither state — say nothing and
-        /// keep the record; it is the only way back if it *did* half-land.
+        /// The write stopped part way through its patches.
+        case interrupted
+        /// The file is gone, unreadable, or in a state we did not make — say
+        /// nothing and keep the record; it is the only way back if the write
+        /// *did* half-land in some way we can't see.
         case unverified
+
+        /// The states a journal-driven restore can put right.
+        var isRecoverable: Bool {
+            self == .abandonedWithAppendix || self == .interrupted
+        }
     }
 
     /// A pending journal describes a write that may or may not have reached
@@ -116,13 +146,24 @@ struct JournalStore: Sendable {
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: record.journal.filePath),
                                    options: .mappedIfSafe)
         else { return .unverified }
-        if record.journal.describesWrittenBytes(data) { return .landed }
-        if record.journal.describesOriginalBytes(data) { return .abandoned }
-        if record.journal.appendedBytes > 0, data.count == record.journal.writtenLength,
-           record.journal.patchesUnwritten(in: data) {
-            return .abandonedWithAppendix
+
+        let journal = record.journal
+        let audit = journal.audit(data)
+        guard !audit.anyForeign else { return .unverified }
+        switch data.count {
+        case journal.writtenLength where audit.allNew:
+            return .landed
+        case journal.writtenLength where audit.allOriginal:
+            return journal.appendedBytes > 0 ? .abandonedWithAppendix : .abandoned
+        case journal.writtenLength:
+            return .interrupted
+        case journal.originalLength where audit.allOriginal:
+            return .abandoned
+        case journal.originalLength:
+            return .interrupted
+        default:
+            return .unverified
         }
-        return .unverified
     }
 
     /// Paths of all files that currently have a journal describing a write that
@@ -130,9 +171,9 @@ struct JournalStore: Sendable {
     /// rescans and relaunches. A journal whose write never landed is not a fix,
     /// but it is left on disk: pruning belongs to the mutation paths (see
     /// `Fixer.recoverInterruptedWrite`), never to a read this can race.
-    func fixedPaths() -> Set<String> {
+    func fixedPaths(in index: JournalIndex? = nil) -> Set<String> {
         var paths = Set<String>()
-        for record in index().records {
+        for record in (index ?? self.index()).records {
             switch resolve(record) {
             case .landed:
                 if !record.journal.isCommitted, !InFlightJournals.shared.contains(record.url) {
@@ -141,11 +182,71 @@ struct JournalStore: Sendable {
                 paths.insert(record.journal.filePath)
             case .unverified:
                 paths.insert(record.journal.filePath)
-            case .abandoned, .abandonedWithAppendix:
+            case .abandoned, .abandonedWithAppendix, .interrupted:
                 continue
             }
         }
         return paths
+    }
+
+    /// Which of a scan's files carry a fix that can be undone.
+    ///
+    /// A journal recorded at a file's own path seals it directly. A file with
+    /// no journal at its path is then matched by content against journals whose
+    /// recorded path no longer holds what they describe — that is how a frame
+    /// renamed after the fix (Lightroom's rename-on-import) keeps its seal. A
+    /// copy of a file that is still fixed is deliberately *not* sealed: that
+    /// journal belongs to the original, and reverting the copy would consume it
+    /// (`Fixer.revert` refuses for the same reason). Nor is anything sealed
+    /// when two of a scan's files answer to one journal — a seal promises an
+    /// undo, and only one of them can have it.
+    ///
+    /// Intended ScanView wiring (the integration pass, not this PR): in
+    /// `scan`, replace `JournalStore.fixedPaths()` with
+    /// `sealedURLs(in: found.map(\.url))` and seal
+    /// `result.sealed.contains(file.url)`; `result.renamedFrom[url]` gives the
+    /// filename the journal recorded, worth printing on the frame's seal so a
+    /// renamed frame explains itself.
+    func sealedURLs(in candidates: [URL]) -> SealResult {
+        let index = index()
+        var result = SealResult()
+        let sealedPaths = fixedPaths(in: index)
+        for url in candidates where sealedPaths.contains(url.path) { result.sealed.insert(url) }
+
+        let unmatched = candidates.filter { !result.sealed.contains($0) }
+        guard !unmatched.isEmpty else { return result }
+
+        // Only a journal whose own file no longer holds its content is free to
+        // seal something else.
+        let orphans = index.records.filter { record in
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: record.journal.filePath),
+                                       options: .mappedIfSafe)
+            else { return true }
+            return !record.journal.describesWrittenBytes(data)
+        }
+        guard !orphans.isEmpty else { return result }
+
+        var matched: [(url: URL, record: JournalRecord)] = []
+        var claims: [URL: Int] = [:]
+        for url in unmatched {
+            guard let data = try? Data(contentsOf: url, options: .mappedIfSafe),
+                  let best = orphans.filter({ $0.journal.describesWrittenBytes(data) })
+                      .max(by: { $0.journal.date < $1.journal.date })
+            else { continue }
+            matched.append((url, best))
+            claims[best.url, default: 0] += 1
+        }
+        for (url, record) in matched where claims[record.url] == 1 {
+            result.sealed.insert(url)
+            result.renamedFrom[url] = record.journal.fileName
+        }
+        return result
+    }
+
+    struct SealResult {
+        var sealed: Set<URL> = []
+        /// For files sealed by content: the filename their journal recorded.
+        var renamedFrom: [URL: String] = [:]
     }
 
     /// What a lookup found, including the parts worth reporting: journal files
@@ -363,37 +464,37 @@ struct Fixer: Sendable {
     }
 
     /// Cleans up after a fix that died mid-commit: a journal for a write that
-    /// never landed is dropped, and one whose appendix landed without its
-    /// patches has those dead end-of-file bytes truncated away. Both leave the
-    /// file exactly as it was before that fix. Only ever called from a path
-    /// that is already about to change this file.
+    /// never landed is dropped, and a write that stopped part way — appendix
+    /// only, or some of its patches — is rolled back to the file's pre-write
+    /// bytes. Both leave the file exactly as it was before that fix. Only ever
+    /// called from a path that is already about to change this file.
     private func recoverInterruptedWrite(for file: URL) throws {
         for record in store.records(for: file).reversed() {
             guard !InFlightJournals.shared.contains(record.url) else { continue }
-            switch store.resolve(record) {
-            case .abandoned:
-                try? store.remove(record)
-            case .abandonedWithAppendix:
-                try truncateAppendix(record.journal)
-                try? store.remove(record)
-            case .landed, .unverified:
-                continue
-            }
+            let resolution = store.resolve(record)
+            guard resolution == .abandoned || resolution.isRecoverable else { continue }
+            if resolution.isRecoverable { try restoreToOriginal(record) }
+            try? store.remove(record)
         }
     }
 
-    /// Drops the bytes an interrupted commit appended. Safe only because the
-    /// resolution proved the file is its pre-write self plus exactly this
-    /// journal's appendix.
-    private func truncateAppendix(_ journal: WriteJournal) throws {
-        let url = URL(fileURLWithPath: journal.filePath)
-        let data = try Data(contentsOf: url, options: .mappedIfSafe)
-        guard journal.appendedBytes > 0, data.count == journal.writtenLength,
-              journal.patchesUnwritten(in: data)
-        else { throw TIFFWriteError.fileChangedSinceFix }
+    /// Rolls a half-written file back: the pre-write bytes at every patched
+    /// region, and none of the appendix. Safe only for a journal that resolves
+    /// to an incomplete write — every region proven to hold either its
+    /// pre-write or its post-write bytes — which is re-checked here rather than
+    /// taken on trust from the caller.
+    private func restoreToOriginal(_ record: JournalRecord) throws {
+        guard store.resolve(record).isRecoverable else {
+            throw TIFFWriteError.fileChangedSinceFix
+        }
+        let url = URL(fileURLWithPath: record.journal.filePath)
         let handle = try FileHandle(forWritingTo: url)
         defer { try? handle.close() }
-        try handle.truncate(atOffset: UInt64(journal.originalLength))
+        for patch in record.journal.patches {
+            try handle.seek(toOffset: UInt64(patch.offset))
+            try handle.write(contentsOf: patch.original)
+        }
+        try handle.truncate(atOffset: UInt64(record.journal.originalLength))
         try handle.synchronize()
     }
 
@@ -437,10 +538,11 @@ struct Fixer: Sendable {
                 // a file still sitting there fixed. Consuming it would leave
                 // that file rewritten with nothing to undo it.
                 if lookup.matchedByContent { try checkOriginMoved(record, target: file) }
-                if lookup.resolution == .abandonedWithAppendix {
-                    // Not a fix to undo: the leftovers of one that died between
-                    // its appendix and its patches.
-                    try truncateAppendix(record.journal.relocated(to: file))
+                if lookup.resolution.isRecoverable {
+                    // Not a fix to undo but the leftovers of one that died
+                    // part way: roll the file back instead.
+                    try restoreToOriginal(JournalRecord(journal: record.journal.relocated(to: file),
+                                                        url: record.url))
                 } else {
                     try TIFFWriter.revert(record.journal.relocated(to: file))
                 }

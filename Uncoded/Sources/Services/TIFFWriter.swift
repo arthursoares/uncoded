@@ -86,28 +86,48 @@ struct WriteJournal: Codable {
     /// Length the file has once the write has landed.
     var writtenLength: Int { originalLength + appendedBytes }
 
+    /// Where each patched region stands. A commit writes its patches one after
+    /// another, so a crash in the middle leaves some regions written and some
+    /// not — a state neither "as written" nor "as it was", and one only this
+    /// per-region verdict can tell apart from a file somebody else edited.
+    struct PatchAudit {
+        /// Every region holds its pre-write bytes.
+        var allOriginal: Bool
+        /// Every region holds its post-write bytes.
+        var allNew: Bool
+        /// Some region holds bytes from neither state — or the journal itself
+        /// doesn't add up. Either way: not ours to touch.
+        var anyForeign: Bool
+    }
+
+    func audit(_ data: Data) -> PatchAudit {
+        guard originalLength >= 0, appendedBytes >= 0, !patches.isEmpty, sampleMatches(data) else {
+            return PatchAudit(allOriginal: false, allNew: false, anyForeign: true)
+        }
+        var audit = PatchAudit(allOriginal: true, allNew: true, anyForeign: false)
+        for patch in patches {
+            // A patch whose two sides differ in length can't be reasoned about
+            // — and restoring it would move every byte after it.
+            guard patch.original.count == patch.new.count else {
+                return PatchAudit(allOriginal: false, allNew: false, anyForeign: true)
+            }
+            let isOriginal = holds(patch.original, at: patch.offset, in: data)
+            let isNew = holds(patch.new, at: patch.offset, in: data)
+            audit.allOriginal = audit.allOriginal && isOriginal
+            audit.allNew = audit.allNew && isNew
+            audit.anyForeign = audit.anyForeign || (!isOriginal && !isNew)
+        }
+        return audit
+    }
+
     /// True when `data` is exactly what this write leaves behind.
     func describesWrittenBytes(_ data: Data) -> Bool {
-        guard appendedBytes >= 0, data.count == writtenLength else { return false }
-        return patchesWritten(in: data)
+        data.count == writtenLength && audit(data).allNew
     }
 
     /// True when `data` is still the pre-write file — the write never landed.
     func describesOriginalBytes(_ data: Data) -> Bool {
-        data.count == originalLength && patchesUnwritten(in: data)
-    }
-
-    /// True when every patched region holds its post-write bytes. Says nothing
-    /// about the file's length: the appendix can be there without the patches.
-    func patchesWritten(in data: Data) -> Bool {
-        guard originalLength >= 0, !patches.isEmpty, sampleMatches(data) else { return false }
-        return patches.allSatisfy { holds($0.new, at: $0.offset, in: data) }
-    }
-
-    /// True when every patched region still holds its pre-write bytes.
-    func patchesUnwritten(in data: Data) -> Bool {
-        guard originalLength >= 0, !patches.isEmpty, sampleMatches(data) else { return false }
-        return patches.allSatisfy { holds($0.original, at: $0.offset, in: data) }
+        data.count == originalLength && audit(data).allOriginal
     }
 
     /// The sample sits inside the original length and outside every patch, so
