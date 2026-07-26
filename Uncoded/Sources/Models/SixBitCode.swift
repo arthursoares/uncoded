@@ -36,13 +36,14 @@ enum SixBitTable {
         return rows
     }()
 
-    /// Codes grouped by code string (several lens generations can share a code).
-    static let byCode: [String: [SixBitCode]] = Dictionary(grouping: all, by: \.code)
+    /// Lens rows grouped by code string (several lens generations can share a
+    /// code). Placeholders stay in `all` for completeness but not here.
+    static let byCode: [String: [SixBitCode]] = Dictionary(grouping: all.filter(\.isLens), by: \.code)
 
-    /// Unique code strings in table order.
+    /// Unique code strings in table order, placeholders excluded.
     static let uniqueCodes: [String] = {
         var seen = Set<String>()
-        return all.compactMap { seen.insert($0.code).inserted ? $0.code : nil }
+        return all.compactMap { $0.isLens && seen.insert($0.code).inserted ? $0.code : nil }
     }()
 
     /// Lens rows by full name, and by name without the generation marker the

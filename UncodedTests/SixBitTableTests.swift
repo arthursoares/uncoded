@@ -55,6 +55,17 @@ final class SixBitTableTests: XCTestCase {
         XCTAssertEqual(checked, 60, "the table's lens rows, macro adapters aside")
     }
 
+    func testPlaceholderRowsAreNotSelectableCodes() {
+        XCTAssertEqual(SixBitTable.all.filter { !$0.isLens }.count, 14)
+        for code in SixBitTable.uniqueCodes {
+            XCTAssertFalse((SixBitTable.byCode[code] ?? []).isEmpty, code)
+        }
+        // 111011 is listed twice: as the Summilux 90mm and as a placeholder.
+        XCTAssertTrue(SixBitTable.uniqueCodes.contains("111011"))
+        XCTAssertFalse(SixBitTable.uniqueCodes.contains("111111"))
+        XCTAssertNil(SixBitTable.match(lensModel: "N/A"))
+    }
+
     /// Rewrites a catalog name the way the camera writes it: "Summicron-M 35mm
     /// f/2 ASPH (I)" -> "Summicron-M 1:2/35 ASPH.", generation marker dropped.
     private func cameraFormat(_ catalog: String) -> String {
