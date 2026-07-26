@@ -9,8 +9,8 @@ final class LensNameParserTests: XCTestCase {
             LensNameParser.parse("Noctilux-M 50mm f/1.2 ASPH")
         )
         XCTAssertEqual(
-            LensNameParser.parse("Summicron-M 1:2/35 ASPH."),
-            LensNameParser.parse("Summicron-M 35mm f/2 ASPH (I)")
+            LensNameParser.key(of: "Summicron-M 1:2/35 ASPH.")?.base,
+            LensNameParser.key(of: "Summicron-M 35mm f/2 ASPH (I)")?.base
         )
     }
 
@@ -18,7 +18,7 @@ final class LensNameParserTests: XCTestCase {
         let id = LensNameParser.parse("Summicron-M 1:2/28 ASPH.")
         XCTAssertEqual(id?.family, "summicron")
         XCTAssertEqual(id?.focalMM, 28)
-        XCTAssertEqual(id?.apertureX10, 20)
+        XCTAssertEqual(id?.apertureX100, 200)
     }
 
     func testMultiFocalLensUsesLastFocal() {
@@ -37,9 +37,25 @@ final class LensNameParserTests: XCTestCase {
         )
     }
 
+    func testFastApertureKeepsHundredthPrecision() {
+        // f/0.95 and f/1 are different lenses wearing different codes.
+        XCTAssertEqual(LensNameParser.parse("Noctilux-M 50mm f/0.95 ASPH")?.apertureX100, 95)
+        XCTAssertEqual(LensNameParser.parse("Noctilux-M 50mm f/1")?.apertureX100, 100)
+        XCTAssertEqual(SixBitTable.match(lensModel: "Noctilux-M 1:0.95/50 ASPH.")?.code, "110001")
+        XCTAssertEqual(SixBitTable.match(lensModel: "Noctilux-M 1:1/50")?.code, "011111")
+    }
+
+    func testGenerationMarkersKeepDistinctCodesApart() {
+        // The ASPH marker is the whole difference between these three codes.
+        XCTAssertEqual(SixBitTable.match(lensModel: "Summicron-M 1:2/35 ASPH.")?.code, "011110")
+        XCTAssertEqual(SixBitTable.match(lensModel: "Summicron-M 1:2/35")?.code, "000110")
+        XCTAssertEqual(SixBitTable.match(lensModel: "APO-Summicron-M 1:2/35 ASPH.")?.code, "001101")
+    }
+
     func testUnparseableReturnsNil() {
         XCTAssertNil(LensNameParser.parse("just words"))
         XCTAssertNil(LensNameParser.parse(""))
+        XCTAssertNil(LensNameParser.key(of: "N/A"))
     }
 
     func testSixBitTableMatchesCameraString() {
@@ -65,5 +81,24 @@ final class LensNameParserTests: XCTestCase {
 
         // Without an identity, table order is preserved.
         XCTAssertEqual(SixBitTable.ranked(for: nil), SixBitTable.uniqueCodes)
+    }
+
+    func testRankedOrdersSameFocalBeforeNearestAperture() {
+        // Same focal always wins: every 50mm code, however far off in
+        // aperture, ranks above codes for other focal lengths.
+        let identity = LensNameParser.parse("Zeiss ZM 50mm f/1.5 Sonnar")
+        let ranked = SixBitTable.ranked(for: identity)
+        func isFifty(_ code: String) -> Bool {
+            (SixBitTable.byCode[code] ?? []).contains { LensNameParser.parse($0.lensName)?.focalMM == 50 }
+        }
+        let fifties = ranked.filter(isFifty)
+        XCTAssertGreaterThan(fifties.count, 5)
+        XCTAssertEqual(Array(ranked.prefix(fifties.count)), fifties,
+                       "every same-focal code should precede other focals")
+
+        // Then nearest aperture: f/1.4 is the closest the table gets to f/1.5.
+        let firstEntries = SixBitTable.byCode[ranked[0]] ?? []
+        XCTAssertTrue(firstEntries.contains { $0.lensName.contains("50mm f/1.4") },
+                      "expected a 50mm f/1.4 code first, got \(firstEntries.map(\.lensName))")
     }
 }

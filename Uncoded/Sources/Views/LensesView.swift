@@ -265,7 +265,7 @@ struct AddLensSheet: View {
         profileFilename = profile.url.lastPathComponent
         if let id = LensNameParser.parse(pretty) {
             focalLength = "\(id.focalMM).0mm"
-            let ap = Double(id.apertureX10) / 10
+            let ap = Double(id.apertureX100) / 100
             aperture = ap == ap.rounded() ? "f/\(Int(ap))" : "f/\(ap)"
             // Re-suggest the most plausible borrowed code for the new specs —
             // but never override a code the user picked themselves.
@@ -313,17 +313,19 @@ private struct ChangeCodeSheet: View {
             HStack {
                 Button("Cancel") { dismiss() }
                 Spacer()
-                Button("Save") {
-                    Mappings.set(code: selection, for: lens, in: context)
-                    dismiss()
-                }
-                .keyboardShortcut(.defaultAction)
+                Button("Save") { save() }
+                    .keyboardShortcut(.defaultAction)
             }
         }
         .padding(20)
         .frame(minWidth: 460, minHeight: 480)
         .background(Theme.bg)
         .preferredColorScheme(.dark)
+    }
+
+    private func save() {
+        Mappings.set(code: selection, for: lens, in: context)
+        dismiss()
     }
 }
 
