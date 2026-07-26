@@ -218,6 +218,28 @@ final class TIFFWriterTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: url), fixture.data)
     }
 
+    func testAPacketThatMovesTakesPaddingWithItSoARefixFitsInPlace() throws {
+        // The M11 pads nothing, so the first fix always has to move the packet.
+        // Without slack, the second fix moves it again and abandons the first
+        // copy — a few KB of dead metadata per re-fix.
+        let url = try writeTemp(makeTIFF(xmp: packet).data)
+        _ = try TIFFWriter.apply(voigtlander, to: url)
+        let afterFirst = try Data(contentsOf: url).count
+
+        var second = voigtlander
+        second.lensModel = "Voigtlander VM 35mm f/1.7 Ultron"
+        second.profileDigest = "0123456789ABCDEF0123456789ABCDEF"
+        _ = try TIFFWriter.apply(second, to: url)
+
+        XCTAssertEqual(try Data(contentsOf: url).count, afterFirst,
+                       "the second fix must rewrite the packet where it already sits")
+        let text = try xmpPacket(of: url)
+        XCTAssertEqual(TIFFReader.xmpValue(text, property: "aux:Lens"),
+                       "Voigtlander VM 35mm f/1.7 Ultron")
+        XCTAssertTrue(text.hasSuffix(#"<?xpacket end="w"?>"#))
+        XCTAssertNoThrow(try XMLDocument(data: Data(text.utf8), options: []))
+    }
+
     func testRevertRestoresByteIdenticalFile() throws {
         let original = makeTIFF(xmp: sampleXMP).data
         let url = try writeTemp(original)
@@ -629,6 +651,100 @@ final class TIFFWriterTests: XCTestCase {
             .elements(forName: "rdf:Description").first)
         XCTAssertEqual(description.attribute(forName: "dc:title")?.stringValue, "a > b")
         XCTAssertEqual(description.attribute(forName: "aux:Lens")?.stringValue, "New Lens")
+    }
+
+    /// Every simple property of the first rdf:Description, by whichever form it
+    /// uses — what the *next* reader of this packet will see.
+    private func properties(of xmp: String) throws -> [String: String] {
+        let document = try XMLDocument(data: Data(xmp.utf8),
+                                      options: [.nodePreserveWhitespace, .nodePreserveCDATA])
+        func find(_ node: XMLNode) -> XMLElement? {
+            if let element = node as? XMLElement, element.name == "rdf:Description" { return element }
+            for child in node.children ?? [] { if let found = find(child) { return found } }
+            return nil
+        }
+        let description = try XCTUnwrap(find(document))
+        var found: [String: String] = [:]
+        for attribute in description.attributes ?? [] {
+            if let name = attribute.name { found[name] = attribute.stringValue ?? "" }
+        }
+        for child in (description.children ?? []).compactMap({ $0 as? XMLElement }) {
+            if let name = child.name { found[name] = child.stringValue ?? "" }
+        }
+        return found
+    }
+
+    func testTransformXMPKeepsNewlinesAndTabsInsideAttributeValues() throws {
+        // NSXML writes a LF/CR/TAB in an attribute value out as itself, and the
+        // next parser collapses each to a space under attribute-value
+        // normalization. The value has to leave as character references or it is
+        // destroyed — and a develop setting is exactly the kind of multi-line
+        // value that gets destroyed.
+        let curve = "0, 0\n32, 22\n255, 255"
+        let xmp = wrap(#"""
+        <rdf:Description rdf:about="" xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/" crs:ToneCurveName="Custom&#xA;two&#x9;tabbed&#xD;returned"/>
+        """#)
+        let before = try properties(of: xmp)
+        XCTAssertEqual(before["crs:ToneCurveName"], "Custom\ntwo\ttabbed\rreturned",
+                       "fixture must actually carry the characters")
+
+        let out = try TIFFWriter.transformXMP(xmp, properties: [("aux:Lens", curve)])
+        XCTAssertTrue(out.contains("&#xA;") && out.contains("&#x9;") && out.contains("&#xD;"),
+                      "expected character references, got literals: \(out)")
+
+        let after = try properties(of: out)
+        XCTAssertEqual(after["crs:ToneCurveName"], before["crs:ToneCurveName"],
+                       "an untouched attribute must survive the rewrite exactly")
+        XCTAssertEqual(after["aux:Lens"], curve, "and so must a value we write ourselves")
+    }
+
+    func testTransformXMPKeepsCarriageReturnsInElementText() throws {
+        // Literal CR in serialized element text is normalized to LF by the next
+        // parser — a different string, irreversibly.
+        let xmp = wrap(#"""
+        <rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">
+         <dc:description>one&#xD;two&#xA;three&#x9;tab</dc:description>
+        </rdf:Description>
+        """#)
+        let before = try properties(of: xmp)
+        XCTAssertEqual(before["dc:description"], "one\rtwo\nthree\ttab")
+
+        let out = try TIFFWriter.transformXMP(xmp, properties: [("aux:Lens", "L")])
+        XCTAssertEqual(try properties(of: out)["dc:description"], "one\rtwo\nthree\ttab")
+    }
+
+    func testTransformXMPRefusesAPacketUsingItsSentinels() throws {
+        // The sentinels are private-use codepoints — legal XML, so a packet that
+        // already holds one can only be refused: rewriting would turn it into a
+        // character reference and change a value we were asked to preserve.
+        let xmp = wrap("<rdf:Description rdf:about=\"\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" dc:title=\"a\u{E000}b\"/>")
+        XCTAssertThrowsError(try TIFFWriter.transformXMP(xmp, properties: [("aux:Lens", "L")])) { error in
+            guard case TIFFWriteError.malformedXMP = error else {
+                return XCTFail("expected malformedXMP, got \(error)")
+            }
+        }
+        // Including when it is the value we were handed.
+        XCTAssertThrowsError(try TIFFWriter.transformXMP(wrap(#"<rdf:Description rdf:about=""/>"#),
+                                                         properties: [("aux:Lens", "a\u{E001}b")]))
+    }
+
+    func testTransformXMPIgnoresDescriptionsAboutADifferentSubject() throws {
+        // rdf:about names the resource a Description talks about. One subject's
+        // properties may be split over several, but a Description about another
+        // resource is not a place to put this file's lens.
+        let xmp = wrap(#"""
+        <rdf:Description rdf:about="Leica Camera AG" xmlns:aux="http://ns.adobe.com/exif/1.0/aux/" aux:Lens="Old Lens"/>
+        <rdf:Description rdf:about="http://example.com/other" xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/" crs:LensProfileName="Someone Else's Profile"/>
+        """#)
+        let out = try TIFFWriter.transformXMP(xmp, properties: [
+            ("aux:Lens", "New Lens"),
+            ("crs:LensProfileName", "Adobe (Ours)"),
+        ])
+        XCTAssertTrue(out.contains("Someone Else&apos;s Profile") || out.contains("Someone Else's Profile"),
+                      "the other subject's property must be untouched: \(out)")
+        XCTAssertEqual(try properties(of: out)["crs:LensProfileName"], "Adobe (Ours)",
+                       "ours goes on our own subject's Description")
+        XCTAssertEqual(try properties(of: out)["aux:Lens"], "New Lens")
     }
 
     func testTransformXMPUpdatesElementFormInPlace() throws {

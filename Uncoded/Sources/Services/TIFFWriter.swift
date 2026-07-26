@@ -448,12 +448,19 @@ struct TIFFWriter {
                 try patch(at: Int(valueOffset),
                           Self.padded(newPacket, toByteCount: entry.count), kind: .value)
             } else {
-                let offset = try u32Offset(append(newBytes))
-                try setCountAndField(entry, count: newBytes.count, field: u32Bytes(offset))
+                // A packet that has to move gets padding on the way out, so the
+                // next fix can rewrite it where it lands. The M11 pads nothing
+                // (2143 bytes of camera XMP against the ~2.3 KB a fix needs), so
+                // without this every re-fix abandons another dead copy at EOF.
+                let grown = Self.padded(newPacket, toByteCount: newBytes.count + Self.slackForRewrites)
+                let offset = try u32Offset(append(grown))
+                try setCountAndField(entry, count: grown.count, field: u32Bytes(offset))
             }
         } else {
             // No XMP at all: create a packet and rebuild IFD0 to reference it.
-            let packet = Data(try Self.transformXMP(Self.emptyPacket, properties: properties).utf8)
+            // Padded for the same reason a moved packet is.
+            let text = try Self.transformXMP(Self.emptyPacket, properties: properties)
+            let packet = Self.padded(text, toByteCount: text.utf8.count + Self.slackForRewrites)
             var additions = [NewEntry(tag: Tag.xmp, type: 1, count: packet.count,
                                       valueField: try valueField(for: packet))]
             if let newExifOffset {
@@ -570,6 +577,16 @@ struct TIFFWriter {
     /// verbatim instead: the header carries a BOM, real M11 packets have a NUL
     /// byte after the trailer, and neither belongs to the document.
     static func transformXMP(_ xmp: String, properties: [(String, String)]) throws -> String {
+        // A sentinel already in the packet would come back out as a character
+        // reference, silently changing a value we were asked to preserve. It is
+        // a private-use codepoint — legal XML, so it can only be refused.
+        guard !whitespaceEscapes.contains(where: { escape in
+            xmp.contains(escape.sentinel) || properties.contains { $0.1.contains(escape.sentinel) }
+        }) else {
+            throw TIFFWriteError.malformedXMP(
+                "it uses a private-use character (U+E000–U+E002) that Uncoded needs while rewriting")
+        }
+
         let packet = Packet(xmp)
         let document: XMLDocument
         do {
@@ -579,7 +596,12 @@ struct TIFFWriter {
                                        options: [.nodePreserveWhitespace, .nodePreserveCDATA,
                                                  .nodeLoadExternalEntitiesNever])
         } catch {
-            throw TIFFWriteError.malformedXMP(error.localizedDescription)
+            // NSXML reports one line per problem and ends with a newline; that
+            // reads badly inside a sentence in a dialog.
+            let detail = error.localizedDescription
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: "\n", with: "; ")
+            throw TIFFWriteError.malformedXMP(detail)
         }
 
         let descriptions = allDescriptions(in: document)
@@ -590,17 +612,75 @@ struct TIFFWriter {
         guard let primary = descriptions.first(where: carriesLensVocabulary) ?? descriptions.first
         else { throw TIFFWriteError.xmpMissingDescription }
 
+        // XMP spreads one subject's properties over as many rdf:Descriptions as
+        // it likes, all naming that subject in rdf:about. A Description about a
+        // *different* subject describes a different resource, and this file's
+        // lens is none of its business — so it is not a candidate.
+        let subject = about(primary)
+        let candidates = descriptions.filter { about($0) == subject }
+
         for (name, value) in properties {
             // A property already present somewhere is updated *there*: adding a
             // second copy on `primary` would make the packet contradict itself.
-            let target = descriptions.first { holds(name, $0) } ?? primary
+            let target = candidates.first { holds(name, $0) } ?? primary
             set(name, to: value, on: target)
         }
 
+        protectWhitespace(in: document)
         let body = (document.children ?? [])
             .map { $0.xmlString(options: [.nodePreserveWhitespace]) }
             .joined()
-        return packet.reassembled(body: body)
+        return packet.reassembled(body: restoreWhitespace(in: body))
+    }
+
+    private static func about(_ element: XMLElement) -> String {
+        element.attribute(forName: "rdf:about")?.stringValue ?? ""
+    }
+
+    /// Characters NSXML will not escape but XML will not carry literally.
+    ///
+    /// Serializing an attribute value writes a LF, CR or TAB out as itself, and
+    /// the next parser to read the packet collapses each of those to a space
+    /// under attribute-value normalization — the value is gone, with no way
+    /// back. A literal CR in element text is the same story: XML line-ending
+    /// normalization turns it into LF. The XMP spec (and Adobe's own writer)
+    /// use the character references, which normalization leaves alone.
+    ///
+    /// NSXML offers no hook into how it escapes, so the characters are swapped
+    /// for private-use sentinels before serializing and the sentinels become
+    /// character references in the serialized text afterwards.
+    private static let whitespaceEscapes:
+        [(character: Character, sentinel: Character, reference: String)] = [
+            ("\n", "\u{E000}", "&#xA;"),
+            ("\r", "\u{E001}", "&#xD;"),
+            ("\t", "\u{E002}", "&#x9;"),
+        ]
+
+    private static func protectWhitespace(in node: XMLNode) {
+        for attribute in (node as? XMLElement)?.attributes ?? [] {
+            guard let value = attribute.stringValue else { continue }
+            var escaped = value
+            for escape in whitespaceEscapes {
+                escaped = escaped.replacingOccurrences(of: String(escape.character),
+                                                       with: String(escape.sentinel))
+            }
+            if escaped != value { attribute.stringValue = escaped }
+        }
+        // Only CR: a LF or TAB in element text survives a round trip as itself.
+        if node.kind == .text, let value = node.stringValue,
+           let cr = whitespaceEscapes.first(where: { $0.character == "\r" }), value.contains(cr.character) {
+            node.stringValue = value.replacingOccurrences(of: String(cr.character),
+                                                          with: String(cr.sentinel))
+        }
+        for child in node.children ?? [] { protectWhitespace(in: child) }
+    }
+
+    private static func restoreWhitespace(in serialized: String) -> String {
+        var result = serialized
+        for escape in whitespaceEscapes {
+            result = result.replacingOccurrences(of: String(escape.sentinel), with: escape.reference)
+        }
+        return result
     }
 
     /// Every rdf:Description in the document, in document order.
@@ -663,6 +743,10 @@ struct TIFFWriter {
             element.addNamespace(declaration)
         }
     }
+
+    /// Whitespace padding given to a packet Uncoded writes somewhere new, so the
+    /// next rewrite fits inside it instead of abandoning this one at EOF.
+    static let slackForRewrites = 2048
 
     /// Grows a packet to exactly `byteCount` bytes with whitespace padding,
     /// placed where the XMP spec puts it: after the XML and *before* the
