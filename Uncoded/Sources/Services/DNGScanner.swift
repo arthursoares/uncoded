@@ -16,6 +16,16 @@ struct ScannedDNG: Identifiable, Hashable, Sendable {
 
     /// The lens string the file currently claims, preferring EXIF over XMP.
     var claimedLens: String? { meta.lensModel ?? meta.auxLens }
+
+    /// The lens the user's mappings send this file to, given a lookup from code
+    /// to mapped lens. Candidates the user never mapped don't count, and a
+    /// re-coded lens claiming several candidates is still one destination —
+    /// only two different lenses are a real ambiguity.
+    func mappedLens<Lens: Identifiable>(_ lensForCode: (String) -> Lens?) -> Lens? {
+        let claimed = codeCandidates.compactMap { lensForCode($0.code) }
+        guard let first = claimed.first, claimed.allSatisfy({ $0.id == first.id }) else { return nil }
+        return first
+    }
 }
 
 /// Recursively scans folders for DNGs and reads their lens claims.

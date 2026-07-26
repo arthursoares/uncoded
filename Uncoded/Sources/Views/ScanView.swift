@@ -265,11 +265,9 @@ struct ScanView: View {
         if let manual = session.overrides[file.url] {
             return Resolution(lens: manual, isManual: true)
         }
-        // When the camera string can't say which generation it is, the code the
-        // user mapped is the one they engraved — but only if exactly one of the
-        // candidates is claimed.
-        let claimed = file.codeCandidates.filter { mappingByCode[$0.code] != nil }
-        guard claimed.count == 1, let lens = mappingByCode[claimed[0].code]?.lens else {
+        // When the camera string can't say which generation it is, the codes the
+        // user mapped say which lens they engraved.
+        guard let lens = file.mappedLens({ mappingByCode[$0]?.lens }) else {
             return Resolution(lens: nil, isManual: false)
         }
         return Resolution(lens: lens, isManual: false)
