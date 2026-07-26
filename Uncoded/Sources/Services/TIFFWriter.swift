@@ -20,12 +20,138 @@ struct WritePatch: Codable {
 
 /// Everything needed to undo a write: restore the patched bytes and truncate
 /// away whatever was appended at end-of-file.
+///
+/// The patches plus `sample` double as a content fingerprint: enough to
+/// identify the file this journal belongs to — so a fixed file renamed after
+/// the fix is still recognised — without hashing a 100 MB raw.
 struct WriteJournal: Codable {
     let filePath: String
     let date: Date
     let originalLength: Int
     let patches: [WritePatch]
     let appendedBytes: Int
+    // Added in v0.2. Optional, so journals written by v0.1.x still decode —
+    // and so v0.1.x still decodes these (it ignores the extra keys).
+    var originalFileName: String?
+    var state: State?
+    var bak: BakRecord?
+    var sample: ContentSample?
+
+    /// A journal is written before the bytes change, so a record on disk does
+    /// not by itself mean the write happened.
+    enum State: String, Codable {
+        case pending
+        case committed
+    }
+
+    /// Identity of the .bak Uncoded made, so a later fix can tell its own
+    /// pristine backup from a stale or foreign one.
+    struct BakRecord: Codable {
+        let size: Int
+        let modified: Date
+
+        /// Modification dates survive a JSON round-trip as floating point;
+        /// second granularity is all the identity check needs.
+        func matches(_ other: BakRecord) -> Bool {
+            size == other.size && abs(modified.timeIntervalSince(other.modified)) < 1
+        }
+    }
+
+    /// A slice of the file outside every patched region — image data, in
+    /// practice. The patched regions hold lens strings and a length, which two
+    /// frames shot with the same lens share; this is what makes the fingerprint
+    /// frame-unique. Absent in v0.1.x journals, which then match on the
+    /// patches alone.
+    struct ContentSample: Codable {
+        let offset: Int
+        let length: Int
+        let hash: String
+
+        /// FNV-1a: not a security hash, just a cheap wide one.
+        static func hash(_ bytes: Data) -> String {
+            var h: UInt64 = 0xCBF2_9CE4_8422_2325
+            for byte in bytes {
+                h ^= UInt64(byte)
+                h = h &* 0x0000_0100_0000_01B3
+            }
+            return String(h, radix: 16)
+        }
+    }
+
+    /// v0.1.x journals were saved only after a successful write.
+    var isCommitted: Bool { (state ?? .committed) == .committed }
+
+    var fileName: String { originalFileName ?? URL(fileURLWithPath: filePath).lastPathComponent }
+
+    /// Length the file has once the write has landed.
+    var writtenLength: Int { originalLength + appendedBytes }
+
+    /// Where each patched region stands. A commit writes its patches one after
+    /// another, so a crash in the middle leaves some regions written and some
+    /// not — a state neither "as written" nor "as it was", and one only this
+    /// per-region verdict can tell apart from a file somebody else edited.
+    struct PatchAudit {
+        /// Every region holds its pre-write bytes.
+        var allOriginal: Bool
+        /// Every region holds its post-write bytes.
+        var allNew: Bool
+        /// Some region holds bytes from neither state — or the journal itself
+        /// doesn't add up. Either way: not ours to touch.
+        var anyForeign: Bool
+    }
+
+    func audit(_ data: Data) -> PatchAudit {
+        guard originalLength >= 0, appendedBytes >= 0, !patches.isEmpty, sampleMatches(data) else {
+            return PatchAudit(allOriginal: false, allNew: false, anyForeign: true)
+        }
+        var audit = PatchAudit(allOriginal: true, allNew: true, anyForeign: false)
+        for patch in patches {
+            // A patch whose two sides differ in length can't be reasoned about
+            // — and restoring it would move every byte after it.
+            guard patch.original.count == patch.new.count else {
+                return PatchAudit(allOriginal: false, allNew: false, anyForeign: true)
+            }
+            let isOriginal = holds(patch.original, at: patch.offset, in: data)
+            let isNew = holds(patch.new, at: patch.offset, in: data)
+            audit.allOriginal = audit.allOriginal && isOriginal
+            audit.allNew = audit.allNew && isNew
+            audit.anyForeign = audit.anyForeign || (!isOriginal && !isNew)
+        }
+        return audit
+    }
+
+    /// True when `data` is exactly what this write leaves behind.
+    func describesWrittenBytes(_ data: Data) -> Bool {
+        data.count == writtenLength && audit(data).allNew
+    }
+
+    /// True when `data` is still the pre-write file — the write never landed.
+    func describesOriginalBytes(_ data: Data) -> Bool {
+        data.count == originalLength && audit(data).allOriginal
+    }
+
+    /// The sample sits inside the original length and outside every patch, so
+    /// it reads the same before and after the write.
+    private func sampleMatches(_ data: Data) -> Bool {
+        guard let sample else { return true }
+        guard sample.offset >= 0, sample.length > 0, sample.offset <= data.count - sample.length
+        else { return false }
+        let slice = data.subdata(in: sample.offset..<(sample.offset + sample.length))
+        return ContentSample.hash(slice) == sample.hash
+    }
+
+    private func holds(_ bytes: Data, at offset: Int, in data: Data) -> Bool {
+        guard offset >= 0, !bytes.isEmpty, offset <= data.count - bytes.count else { return false }
+        return data.subdata(in: offset..<(offset + bytes.count)) == bytes
+    }
+
+    /// The same write, recorded against a file that has moved since.
+    func relocated(to url: URL) -> WriteJournal {
+        guard url.path != filePath else { return self }
+        return WriteJournal(filePath: url.path, date: date, originalLength: originalLength,
+                            patches: patches, appendedBytes: appendedBytes,
+                            originalFileName: fileName, state: state, bak: bak, sample: sample)
+    }
 }
 
 enum TIFFWriteError: Error, LocalizedError {
@@ -99,18 +225,34 @@ struct TIFFWriter {
         self.layout = try TIFFReader(data: data).structure()
     }
 
+    /// A planned write: nothing on disk has been touched, but the journal that
+    /// describes the change already exists. Splitting the two lets the caller
+    /// persist the undo record *before* the bytes move.
+    struct Prepared {
+        let journal: WriteJournal
+        fileprivate let writer: TIFFWriter
+        fileprivate let url: URL
+
+        func commit() throws { try writer.commit(to: url) }
+    }
+
+    /// Plans the write and returns it with its journal, unapplied.
+    static func prepare(_ write: LensWrite, to url: URL) throws -> Prepared {
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
+        var writer = try TIFFWriter(data: data)
+        try writer.plan(write)
+        return Prepared(journal: writer.journal(for: url), writer: writer, url: url)
+    }
+
     /// Applies the write to the file on disk and returns the journal.
     /// With `dryRun` the file is untouched and the journal describes what
     /// would change.
     static func apply(_ write: LensWrite, to url: URL, dryRun: Bool = false) throws -> WriteJournal {
-        let data = try Data(contentsOf: url, options: .mappedIfSafe)
-        var writer = try TIFFWriter(data: data)
-        try writer.plan(write)
-        let journal = writer.journal(for: url)
+        let prepared = try prepare(write, to: url)
         if !dryRun {
-            try writer.commit(to: url)
+            try prepared.commit()
         }
-        return journal
+        return prepared.journal
     }
 
     /// Restores a file to its pre-write state using the journal — but only
@@ -514,7 +656,28 @@ struct TIFFWriter {
         }
         return WriteJournal(filePath: url.path, date: Date(),
                             originalLength: originalLength,
-                            patches: recorded, appendedBytes: appendix.count)
+                            patches: recorded, appendedBytes: appendix.count,
+                            originalFileName: url.lastPathComponent,
+                            state: .pending, sample: contentSample(besides: recorded))
+    }
+
+    /// Picks a window of untouched bytes near end-of-file — image data, on a
+    /// real frame — to give the journal something no other frame shares.
+    private func contentSample(besides recorded: [WritePatch]) -> WriteJournal.ContentSample? {
+        let length = min(4096, originalLength / 4)
+        guard length > 0 else { return nil }
+        var offset = originalLength - length
+        while offset >= 0 {
+            let end = offset + length
+            let clear = !recorded.contains { $0.offset < end && offset < $0.offset + $0.new.count }
+            if clear {
+                let slice = data.subdata(in: offset..<end)
+                return WriteJournal.ContentSample(offset: offset, length: length,
+                                                  hash: WriteJournal.ContentSample.hash(slice))
+            }
+            offset -= length
+        }
+        return nil
     }
 
     /// Write ordering is the whole safety story here: a crash or a full disk
