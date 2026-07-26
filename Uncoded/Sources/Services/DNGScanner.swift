@@ -31,23 +31,34 @@ struct ScannedDNG: Identifiable, Hashable, Sendable {
 /// Recursively scans folders for DNGs and reads their lens claims.
 enum DNGScanner {
     /// What a scan found. An empty `files` list is ambiguous on its own —
-    /// no DNGs, DNGs we weren't allowed to read, or a folder that never
-    /// opened — so the counts travel with it.
+    /// no DNGs, DNGs we weren't allowed to read, a subtree that was skipped,
+    /// or a folder that never opened — so the counts travel with it.
     struct Outcome: Sendable {
         var files: [ScannedDNG] = []
         var unreadable = 0
+        /// Subfolders the walk couldn't open. Their DNGs are simply absent from
+        /// `files`, so a complete-looking scan would otherwise be a lie.
+        var skippedSubfolders = 0
         var folderReadable = true
     }
 
     static func scan(folder: URL) -> Outcome {
         let fm = FileManager.default
         var urls: [URL] = []
+        var skipped = 0
 
         if folder.hasDirectoryPath {
             // access(R_OK) can still succeed where TCC blocks opendir, so probe
             // by actually listing the directory.
             guard (try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) != nil,
-                  let found = fm.enumerator(at: folder, includingPropertiesForKeys: nil)
+                  let found = fm.enumerator(at: folder, includingPropertiesForKeys: nil,
+                                            options: [],
+                                            errorHandler: { _, _ in
+                                                // Keep walking the rest of the
+                                                // tree; the count is surfaced.
+                                                skipped += 1
+                                                return true
+                                            })
             else { return Outcome(folderReadable: false) }
             for case let url as URL in found where url.pathExtension.lowercased() == "dng" {
                 urls.append(url)
@@ -57,6 +68,7 @@ enum DNGScanner {
         }
 
         var outcome = Outcome()
+        outcome.skippedSubfolders = skipped
         for url in urls.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
             guard let meta = try? TIFFReader.read(url: url) else {
                 outcome.unreadable += 1

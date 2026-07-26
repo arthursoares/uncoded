@@ -57,6 +57,25 @@ final class DNGScannerTests: XCTestCase {
         XCTAssertTrue(outcome.files.isEmpty)
     }
 
+    /// A readable root with one subfolder the walk can't open: the DNGs it
+    /// can reach must still arrive, and the skipped subtree must be reported
+    /// rather than passed off as a complete scan.
+    func testUnreadableSubfolderIsReportedNotSwallowed() throws {
+        let fm = FileManager.default
+        try minimalTIFF().write(to: root.appendingPathComponent("top.dng"))
+        let locked = root.appendingPathComponent("locked", isDirectory: true)
+        try fm.createDirectory(at: locked, withIntermediateDirectories: true)
+        try minimalTIFF().write(to: locked.appendingPathComponent("hidden.dng"))
+        try fm.setAttributes([.posixPermissions: 0o000], ofItemAtPath: locked.path)
+        defer { try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: locked.path) }
+
+        let outcome = DNGScanner.scan(folder: root)
+        XCTAssertEqual(outcome.files.map(\.filename), ["top.dng"])
+        XCTAssertEqual(outcome.skippedSubfolders, 1)
+        XCTAssertTrue(outcome.folderReadable, "the root itself was readable")
+        XCTAssertEqual(outcome.unreadable, 0, "an unopenable folder is not an unreadable file")
+    }
+
     /// Stand-in for a TCC-blocked folder: listable-by-nobody.
     func testUnlistableFolderReportsUnreadable() throws {
         let fm = FileManager.default

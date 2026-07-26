@@ -80,9 +80,11 @@ final class ScanSession {
     var lastRunSummary: String?
     var showFailuresOnly = false
 
-    /// DNGs that were found but couldn't be read, and whether the folder
-    /// itself opened at all — an empty grid means different things per case.
+    /// DNGs that were found but couldn't be read, subfolders the walk had to
+    /// skip, and whether the folder itself opened at all — an empty grid, and
+    /// a full one, mean different things per case.
     var unreadableCount = 0
+    var skippedSubfolders = 0
     var folderReadable = true
 
     @ObservationIgnored var batchTask: Task<Void, Never>?

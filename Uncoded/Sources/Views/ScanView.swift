@@ -242,6 +242,12 @@ struct ScanView: View {
                     title: "\(session.unreadableCount) DNG\(session.unreadableCount == 1 ? "" : "s") found, none readable",
                     body: "The files are there but their metadata couldn't be read. Usually macOS privacy protection: System Settings → Privacy & Security → Files and Folders (or Full Disk Access). Damaged or non-Leica DNGs can also land here.",
                     showsPrivacyButton: true)
+            } else if session.skippedSubfolders > 0 {
+                emptyPanel(
+                    icon: "folder.badge.questionmark",
+                    title: "\(session.skippedSubfolders) subfolder\(session.skippedSubfolders == 1 ? "" : "s") couldn't be opened",
+                    body: "No DNGs outside them, and the walk was turned away at the ones it skipped — usually macOS privacy protection: System Settings → Privacy & Security → Files and Folders (or Full Disk Access).",
+                    showsPrivacyButton: true)
             } else if let folder = session.folder {
                 emptyPanel(
                     icon: "magnifyingglass",
@@ -388,6 +394,10 @@ struct ScanView: View {
         if session.unreadableCount > 0 {
             stat("\(session.unreadableCount)", "unreadable", color: Theme.rebate)
                 .help("Found but not readable — check System Settings → Privacy & Security")
+        }
+        if session.skippedSubfolders > 0 {
+            stat("\(session.skippedSubfolders)", "skipped", color: Theme.rebate)
+                .help("Subfolder\(session.skippedSubfolders == 1 ? "" : "s") Uncoded couldn't open — any DNGs inside are missing from this scan. Check System Settings → Privacy & Security.")
         }
         if plan.failureCount > 0 { failureChip(plan.failureCount) }
         if let summary = session.lastRunSummary, !session.busyNow {
@@ -752,6 +762,7 @@ struct ScanView: View {
         session.overrides = [:]
         session.fixState = [:]
         session.unreadableCount = 0
+        session.skippedSubfolders = 0
         session.folderReadable = true
         session.showFailuresOnly = false
         session.lastRunSummary = nil
@@ -761,6 +772,7 @@ struct ScanView: View {
             }.value
             session.results = outcome.files
             session.unreadableCount = outcome.unreadable
+            session.skippedSubfolders = outcome.skippedSubfolders
             session.folderReadable = outcome.folderReadable
             // Files with a persisted journal were fixed in an earlier session —
             // restore their FIXED seals so revert stays reachable.
