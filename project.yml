@@ -31,6 +31,14 @@ targets:
     scheme:
       testTargets:
         - UncodedTests
+      # Xcode gives a hosted test bundle a scrubbed environment, so the real-file
+      # tests can only see UNCODED_TEST_DNG if the scheme forwards it. The value
+      # is a build setting, which xcodebuild takes on the command line:
+      #   xcodebuild … test UNCODED_TEST_DNG=/path/to/copy.dng
+      environmentVariables:
+        - variable: UNCODED_TEST_DNG
+          value: $(UNCODED_TEST_DNG)
+          isEnabled: true
   UncodedTests:
     type: bundle.unit-test
     platform: macOS
