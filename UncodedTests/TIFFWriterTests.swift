@@ -352,8 +352,9 @@ final class TIFFWriterTests: XCTestCase {
 
     func testRefusesIFDEndingAtEOF() throws {
         // An Exif IFD whose 4-byte next-IFD pointer is missing, and a missing
-        // LensMake so the writer has to rebuild that IFD — the rebuild used to
-        // read those absent bytes.
+        // LensMake so the writer has to rebuild that IFD. The rebuild used to
+        // read those absent bytes and trap; parseIFD now rejects the file
+        // outright, and the rebuild's slice() is the second line of defence.
         let make = Data("Leica Camera AG".utf8) + Data([0])
         let lensModel = Data("Summicron-M 1:2/35 ASPH.".utf8) + Data([0])
         let xmp = Data(sampleXMP.utf8)
@@ -379,6 +380,98 @@ final class TIFFWriterTests: XCTestCase {
         write.focalMM = nil
         write.apertureF = nil
         try assertRefuses(data, write)
+    }
+
+    func testRefusesIFDThatCannotHoldMoreEntries() throws {
+        // 65535 entries is a legal IFD; adding LensMake and LensModel to it
+        // can't be expressed in the UInt16 entry count.
+        let full = Int(UInt16.max)
+        let lensModel = Data("Summicron-M 1:2/35 ASPH.".utf8) + Data([0])
+        let xmp = Data(sampleXMP.utf8)
+        let ifd0Offset = 8
+        let xmpOff = ifd0Offset + 2 + 2 * 12 + 4
+        let lensModelOff = xmpOff + xmp.count
+        let exifOff = lensModelOff + lensModel.count
+
+        var data = Data("II".utf8) + u16(42) + u32(UInt32(ifd0Offset))
+        data += u16(2)
+        data += entry(tag: 0x02BC, type: 1, count: UInt32(xmp.count), value: UInt32(xmpOff))
+        data += entry(tag: 0x8769, type: 4, count: 1, value: UInt32(exifOff))
+        data += u32(0)
+        data += xmp + lensModel
+        data += u16(UInt16(full))
+        // All the same tag: the rebuild copies raw entries, so the count is what
+        // matters, and neither LensMake nor LensModel is among them.
+        let filler = entry(tag: 0x1000, type: 1, count: 4, value: 0)
+        data.reserveCapacity(data.count + full * 12 + 4)
+        for _ in 0..<full { data += filler }
+        data += u32(0)
+
+        var write = voigtlander
+        write.focalMM = nil
+        write.apertureF = nil
+        try assertRefuses(data, write) { error in
+            guard case TIFFWriteError.corruptStructure = error else {
+                return XCTFail("expected corruptStructure, got \(error)")
+            }
+        }
+    }
+
+    func testRevertRefusesMalformedJournal() throws {
+        let original = makeTIFF(xmp: sampleXMP).data
+        let url = try writeTemp(original)
+        let good = try TIFFWriter.apply(voigtlander, to: url, dryRun: true)
+
+        func journal(patches: [WritePatch], originalLength: Int = original.count,
+                     appended: Int = 0) -> WriteJournal {
+            WriteJournal(filePath: url.path, date: Date(), originalLength: originalLength,
+                         patches: patches, appendedBytes: appended)
+        }
+        let sane = WritePatch(offset: 0, original: Data([1, 2]), new: original.prefix(2))
+
+        // Numbers a journal should never hold: each used to trap in subdata or
+        // in the UInt64 conversions.
+        let malformed = [
+            journal(patches: [WritePatch(offset: -8, original: Data([0, 0]), new: Data([0, 0]))]),
+            journal(patches: [sane], originalLength: -1),
+            journal(patches: [sane], appended: -1),
+            journal(patches: [WritePatch(offset: original.count - 1, original: Data([0]),
+                                        new: Data([0, 0, 0, 0]))]),
+            journal(patches: [WritePatch(offset: 0, original: Data(), new: original.prefix(2))]),
+        ]
+        for bad in malformed {
+            XCTAssertThrowsError(try TIFFWriter.revert(bad)) { error in
+                guard case TIFFWriteError.fileChangedSinceFix = error else {
+                    return XCTFail("expected fileChangedSinceFix, got \(error)")
+                }
+            }
+            XCTAssertEqual(try Data(contentsOf: url), original)
+        }
+        XCTAssertFalse(good.patches.isEmpty, "the dry run should still have planned a real write")
+    }
+
+    // MARK: - Commit ordering
+
+    func testJournalOrdersValueBytesBeforePointers() throws {
+        // commit() writes the journal's patches in order, and the ordering is the
+        // crash-safety invariant: no count or offset field may be written before
+        // the bytes it describes.
+        let fixture = makeTIFF(xmp: sampleXMP)
+        let url = try writeTemp(fixture.data)
+        let journal = try TIFFWriter.apply(voigtlander, to: url, dryRun: true)
+
+        // A patch landing inside an IFD's entry array (or in the header) touches
+        // a count/offset field; anything else is value bytes.
+        let entryArrays = [fixture.ifd0Offset, fixture.exifIFDOffset].map { $0 + 2 ..< $0 + 2 + 4 * 12 }
+        let isPointer = journal.patches.map { patch in
+            patch.offset < 8 || entryArrays.contains { $0.contains(patch.offset) }
+        }
+        XCTAssertTrue(isPointer.contains(true), "fixture must exercise pointer patches")
+        XCTAssertTrue(isPointer.contains(false), "fixture must exercise value patches")
+        if let firstPointer = isPointer.firstIndex(of: true) {
+            XCTAssertFalse(isPointer[firstPointer...].contains(false),
+                           "value patches must all precede pointer patches: \(isPointer)")
+        }
     }
 
     func testRefusesNonTextLensModel() throws {
@@ -422,9 +515,9 @@ final class TIFFWriterTests: XCTestCase {
         }
     }
 
-    func testTransformXMPReplacesAndInserts() {
+    func testTransformXMPReplacesAndInserts() throws {
         let xmp = #"<rdf:Description rdf:about="" xmlns:aux="http://ns.adobe.com/exif/1.0/aux/" aux:Lens="Old Lens"/>"#
-        let out = TIFFWriter.transformXMP(xmp, properties: [
+        let out = try TIFFWriter.transformXMP(xmp, properties: [
             ("aux:Lens", "New Lens"),
             ("crs:LensProfileName", "Adobe (Profile)"),
         ])
@@ -434,9 +527,22 @@ final class TIFFWriterTests: XCTestCase {
         XCTAssertTrue(out.contains("xmlns:crs="), "missing namespace must be declared")
     }
 
-    func testTransformXMPEscapesValues() {
-        let out = TIFFWriter.transformXMP(#"<rdf:Description rdf:about=""/>"#,
-                                          properties: [("aux:Lens", "A \"B\" & <C>")])
+    func testTransformXMPEscapesValues() throws {
+        let out = try TIFFWriter.transformXMP(#"<rdf:Description rdf:about=""/>"#,
+                                              properties: [("aux:Lens", "A \"B\" & <C>")])
         XCTAssertTrue(out.contains("A &quot;B&quot; &amp; &lt;C&gt;"))
+    }
+
+    func testTransformXMPRefusesPacketWithoutDescription() throws {
+        // Nowhere to put the properties: reporting success would mean an EXIF-only
+        // fix with untouched XMP.
+        let xmp = #"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF/></x:xmpmeta>"#
+        XCTAssertThrowsError(try TIFFWriter.transformXMP(xmp, properties: [("aux:Lens", "L")])) { error in
+            guard case TIFFWriteError.xmpMissingDescription = error else {
+                return XCTFail("expected xmpMissingDescription, got \(error)")
+            }
+        }
+        let packetWithoutDescription = xmp + String(repeating: " ", count: 512)
+        try assertRefuses(makeTIFF(xmp: packetWithoutDescription).data)
     }
 }
