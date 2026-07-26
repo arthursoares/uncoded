@@ -293,9 +293,11 @@ private struct ChangeCodeSheet: View {
     @Environment(\.modelContext) private var context
     @Environment(\.dismiss) private var dismiss
     @State private var selection: String?
+    private let hadCode: Bool
 
     init(lens: UserLens) {
         self.lens = lens
+        hadCode = lens.mappings.first != nil
         _selection = State(initialValue: lens.mappings.first?.code)
     }
 
@@ -313,8 +315,25 @@ private struct ChangeCodeSheet: View {
             HStack {
                 Button("Cancel") { dismiss() }
                 Spacer()
-                Button("Save") { save() }
-                    .keyboardShortcut(.defaultAction)
+                // Clicking the current code again clears the selection, which
+                // un-codes the lens on save — name that instead of letting it
+                // hide behind a plain "Save".
+                if selection == nil {
+                    if hadCode {
+                        Button("Remove Code", role: .destructive) { save() }
+                            .keyboardShortcut(.defaultAction)
+                    } else {
+                        Text("pick the code this lens wears")
+                            .font(.system(size: 10))
+                            .foregroundStyle(Theme.faint)
+                        Button("Save") { save() }
+                            .keyboardShortcut(.defaultAction)
+                            .disabled(true)
+                    }
+                } else {
+                    Button("Save") { save() }
+                        .keyboardShortcut(.defaultAction)
+                }
             }
         }
         .padding(20)
