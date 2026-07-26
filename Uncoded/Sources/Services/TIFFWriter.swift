@@ -32,6 +32,10 @@ enum TIFFWriteError: Error, LocalizedError {
     case missingTag(String)
     case corruptStructure
     case fileChangedSinceFix
+    case nonTextTag(tag: UInt16, type: UInt16)
+    case undecodableXMP
+    case invalidValue(String)
+    case fileTooLarge
 
     var errorDescription: String? {
         switch self {
@@ -39,6 +43,17 @@ enum TIFFWriteError: Error, LocalizedError {
         case .corruptStructure: return "File structure not understood; refusing to write"
         case .fileChangedSinceFix:
             return "This file changed since Uncoded fixed it — reverting would damage it. Restore the .bak copy instead."
+        case .nonTextTag(let tag, let type):
+            return String(format: """
+            Field 0x%04X holds TIFF type %d, not ASCII text (type 2). Uncoded \
+            only rewrites text fields it can read back, so this file is left \
+            untouched rather than having those bytes reinterpreted.
+            """, tag, type)
+        case .undecodableXMP:
+            return "This file's XMP block is not UTF-8 text. Rewriting it would throw away metadata Uncoded cannot read (develop settings, ratings, GPS), so the file is left untouched."
+        case .invalidValue(let detail): return detail
+        case .fileTooLarge:
+            return "File is too large for TIFF's 32-bit offsets; refusing to write"
         }
     }
 }
@@ -52,7 +67,15 @@ struct TIFFWriter {
     private let layout: TIFFReader.TIFFStructure
     private let originalLength: Int
 
-    private var patches: [(offset: Int, new: Data)] = []
+    /// Value bytes are written (and flushed) before the pointers and counts
+    /// that describe them, so an interrupted commit never leaves a field
+    /// pointing at bytes that aren't on disk.
+    private enum PatchKind {
+        case value
+        case pointer
+    }
+
+    private var patches: [(offset: Int, new: Data, kind: PatchKind)] = []
     private var appendix = Data()
 
     private enum Tag {
@@ -74,7 +97,7 @@ struct TIFFWriter {
     /// With `dryRun` the file is untouched and the journal describes what
     /// would change.
     static func apply(_ write: LensWrite, to url: URL, dryRun: Bool = false) throws -> WriteJournal {
-        let data = try Data(contentsOf: url, options: .alwaysMapped)
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
         var writer = try TIFFWriter(data: data)
         try writer.plan(write)
         let journal = writer.journal(for: url)
@@ -91,7 +114,7 @@ struct TIFFWriter {
     /// it, so we refuse instead.
     static func revert(_ journal: WriteJournal) throws {
         let url = URL(fileURLWithPath: journal.filePath)
-        let data = try Data(contentsOf: url, options: .alwaysMapped)
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
         guard data.count == journal.originalLength + journal.appendedBytes else {
             throw TIFFWriteError.fileChangedSinceFix
         }
@@ -121,17 +144,20 @@ struct TIFFWriter {
         try setString(Tag.lensModel, write.lensModel, in: layout.exif, additions: &exifAdditions)
 
         if let focal = write.focalMM {
-            try setRationals(Tag.focalLength, [focal], in: layout.exif, additions: &exifAdditions)
-            if let aperture = write.apertureF {
-                try setRationals(Tag.lensSpec, [focal, focal, aperture, aperture],
-                                 in: layout.exif, additions: &exifAdditions)
-            }
+            try setRationals(Tag.focalLength, [focal], field: "Focal length",
+                             in: layout.exif, additions: &exifAdditions)
+        }
+        // Independent of the FocalLength write above: LensSpecification needs
+        // both numbers, but a missing one must never silently swallow the other.
+        if let focal = write.focalMM, let aperture = write.apertureF {
+            try setRationals(Tag.lensSpec, [focal, focal, aperture, aperture],
+                             field: "Lens specification", in: layout.exif, additions: &exifAdditions)
         }
 
         var newExifOffset: UInt32?
         if !exifAdditions.isEmpty {
             guard let exifOffset = layout.exifIFDOffset else { throw TIFFWriteError.missingTag("Exif IFD") }
-            newExifOffset = UInt32(rebuildIFD(at: exifOffset, adding: exifAdditions))
+            newExifOffset = try u32Offset(rebuildIFD(at: exifOffset, adding: exifAdditions))
         }
 
         try setXMP(write, newExifOffset: newExifOffset)
@@ -140,7 +166,7 @@ struct TIFFWriter {
         // wasn't rebuilt — setXMP handles the pointer when it rebuilds IFD0).
         if let newExifOffset, !rebuiltIFD0 {
             guard let pointer = layout.ifd0[Tag.exifIFD] else { throw TIFFWriteError.corruptStructure }
-            patch(at: pointer.fieldOffset, u32Bytes(newExifOffset))
+            try patch(at: pointer.fieldOffset, u32Bytes(newExifOffset), kind: .pointer)
         }
     }
 
@@ -156,54 +182,60 @@ struct TIFFWriter {
 
         guard let entry = ifd[tag] else {
             additions.append(NewEntry(tag: tag, type: 2, count: bytes.count,
-                                      valueField: valueField(for: bytes)))
+                                      valueField: try valueField(for: bytes)))
             return
         }
+        guard entry.type == 2 else { throw TIFFWriteError.nonTextTag(tag: tag, type: entry.type) }
 
-        let oldSize = entry.count * (entry.type == 2 ? 1 : 1)
+        let oldSize = (TIFFReader.typeSizes[entry.type] ?? 1) * entry.count
         if oldSize <= 4 {
             if bytes.count <= 4 {
-                patch(at: entry.fieldOffset - 4, u32Bytes(UInt32(bytes.count)))
-                patch(at: entry.fieldOffset, bytes.padded(to: 4))
+                try patch(at: entry.fieldOffset, bytes.padded(to: 4), kind: .value)
+                try patch(at: entry.fieldOffset - 4, u32Bytes(UInt32(bytes.count)), kind: .pointer)
             } else {
-                let offset = append(bytes)
-                patch(at: entry.fieldOffset - 4, u32Bytes(UInt32(bytes.count)))
-                patch(at: entry.fieldOffset, u32Bytes(UInt32(offset)))
+                let offset = try u32Offset(append(bytes))
+                try patch(at: entry.fieldOffset - 4, u32Bytes(UInt32(bytes.count)), kind: .pointer)
+                try patch(at: entry.fieldOffset, u32Bytes(offset), kind: .pointer)
             }
         } else {
             guard let valueOffset = TIFFReader.u32(data, at: entry.fieldOffset, littleEndian: layout.littleEndian) else {
                 throw TIFFWriteError.corruptStructure
             }
             if bytes.count <= oldSize {
-                patch(at: entry.fieldOffset - 4, u32Bytes(UInt32(bytes.count)))
-                patch(at: Int(valueOffset), bytes)
+                try patch(at: Int(valueOffset), bytes, kind: .value)
+                try patch(at: entry.fieldOffset - 4, u32Bytes(UInt32(bytes.count)), kind: .pointer)
             } else {
-                let offset = append(bytes)
-                patch(at: entry.fieldOffset - 4, u32Bytes(UInt32(bytes.count)))
-                patch(at: entry.fieldOffset, u32Bytes(UInt32(offset)))
+                let offset = try u32Offset(append(bytes))
+                try patch(at: entry.fieldOffset - 4, u32Bytes(UInt32(bytes.count)), kind: .pointer)
+                try patch(at: entry.fieldOffset, u32Bytes(offset), kind: .pointer)
             }
         }
     }
 
     /// Sets a RATIONAL tag (same count in place — rationals never change size).
-    private mutating func setRationals(_ tag: UInt16, _ values: [Double],
+    private mutating func setRationals(_ tag: UInt16, _ values: [Double], field: String,
                                        in ifd: [UInt16: TIFFReader.TIFFEntry],
                                        additions: inout [NewEntry]) throws {
         var bytes = Data()
         for v in values {
+            // A nonsensical number must be reported, not truncated into a
+            // trapping UInt32 conversion.
+            guard v.isFinite, v > 0, v <= 1_000_000 else {
+                throw TIFFWriteError.invalidValue("\(field) \(v) is out of range")
+            }
             bytes.append(u32Bytes(UInt32((v * 1000).rounded())))
             bytes.append(u32Bytes(1000))
         }
 
         guard let entry = ifd[tag] else {
             additions.append(NewEntry(tag: tag, type: 5, count: values.count,
-                                      valueField: valueField(for: bytes)))
+                                      valueField: try valueField(for: bytes)))
             return
         }
         guard entry.type == 5, entry.count == values.count,
               let valueOffset = TIFFReader.u32(data, at: entry.fieldOffset, littleEndian: layout.littleEndian)
         else { throw TIFFWriteError.corruptStructure }
-        patch(at: Int(valueOffset), bytes)
+        try patch(at: Int(valueOffset), bytes, kind: .value)
     }
 
     /// Rewrites the XMP packet with the lens properties. Fits → in-place with
@@ -223,8 +255,13 @@ struct TIFFWriter {
             guard let valueOffset = TIFFReader.u32(data, at: entry.fieldOffset, littleEndian: layout.littleEndian),
                   entry.count > 4
             else { throw TIFFWriteError.corruptStructure }
-            let oldBytes = data.subdata(in: Int(valueOffset)..<(Int(valueOffset) + entry.count))
-            let oldXMP = String(data: oldBytes, encoding: .utf8) ?? Self.emptyPacket
+            let oldBytes = try slice(Int(valueOffset), entry.count)
+            // A packet we can't decode is a packet we can't safely rewrite:
+            // substituting an empty one would silently drop develop settings,
+            // ratings and GPS. (A UTF-8 BOM decodes fine and round-trips.)
+            guard let oldXMP = String(data: oldBytes, encoding: .utf8) else {
+                throw TIFFWriteError.undecodableXMP
+            }
             var newBytes = Data(Self.transformXMP(oldXMP, properties: properties).utf8)
             // The old packet's whitespace padding rides along in the transform;
             // strip it so the size check sees the real content, then re-pad.
@@ -234,23 +271,23 @@ struct TIFFWriter {
 
             if newBytes.count <= entry.count {
                 newBytes.append(Data(repeating: 0x20, count: entry.count - newBytes.count))
-                patch(at: Int(valueOffset), newBytes)
+                try patch(at: Int(valueOffset), newBytes, kind: .value)
             } else {
-                let offset = append(newBytes)
-                patch(at: entry.fieldOffset - 4, u32Bytes(UInt32(newBytes.count)))
-                patch(at: entry.fieldOffset, u32Bytes(UInt32(offset)))
+                let offset = try u32Offset(append(newBytes))
+                try patch(at: entry.fieldOffset - 4, u32Bytes(UInt32(newBytes.count)), kind: .pointer)
+                try patch(at: entry.fieldOffset, u32Bytes(offset), kind: .pointer)
             }
         } else {
             // No XMP at all: create a packet and rebuild IFD0 to reference it.
             let packet = Data(Self.transformXMP(Self.emptyPacket, properties: properties).utf8)
             var additions = [NewEntry(tag: Tag.xmp, type: 1, count: packet.count,
-                                      valueField: valueField(for: packet))]
+                                      valueField: try valueField(for: packet))]
             if let newExifOffset {
                 additions.append(NewEntry(tag: Tag.exifIFD, type: 4, count: 1,
                                           valueField: u32Bytes(newExifOffset)))
             }
-            let newIFD0 = rebuildIFD(at: layout.ifd0Offset, adding: additions)
-            patch(at: 4, u32Bytes(UInt32(newIFD0)))
+            let newIFD0 = try u32Offset(rebuildIFD(at: layout.ifd0Offset, adding: additions))
+            try patch(at: 4, u32Bytes(newIFD0), kind: .pointer)
             rebuiltIFD0 = true
         }
     }
@@ -266,15 +303,18 @@ struct TIFFWriter {
 
     /// Copies an IFD to the appendix with entries added/replaced (kept sorted
     /// by tag, as TIFF requires) and returns the new IFD's offset.
-    private mutating func rebuildIFD(at offset: Int, adding: [NewEntry]) -> Int {
+    private mutating func rebuildIFD(at offset: Int, adding: [NewEntry]) throws -> Int {
         let le = layout.littleEndian
-        let count = Int(TIFFReader.u16(data, at: offset, littleEndian: le) ?? 0)
+        guard let countRaw = TIFFReader.u16(data, at: offset, littleEndian: le) else {
+            throw TIFFWriteError.corruptStructure
+        }
+        let count = Int(countRaw)
 
         var entries: [(tag: UInt16, bytes: Data)] = []
         for i in 0..<count {
             let base = offset + 2 + i * 12
             guard let tag = TIFFReader.u16(data, at: base, littleEndian: le) else { continue }
-            var bytes = data.subdata(in: base..<(base + 12))
+            var bytes = try slice(base, 12)
             // Absorb pending in-place patches that target this entry — the
             // entry is moving into the rebuilt IFD, so patching the old
             // location would strand them.
@@ -295,7 +335,7 @@ struct TIFFWriter {
         }
         entries.sort { $0.tag < $1.tag }
 
-        let nextPointer = data.subdata(in: (offset + 2 + count * 12)..<(offset + 2 + count * 12 + 4))
+        let nextPointer = try slice(offset + 2 + count * 12, 4)
 
         var ifd = u16Bytes(UInt16(entries.count))
         for entry in entries { ifd.append(entry.bytes) }
@@ -370,8 +410,36 @@ struct TIFFWriter {
 
     // MARK: - Patch/append plumbing
 
-    private mutating func patch(at offset: Int, _ bytes: Data) {
-        patches.append((offset, bytes))
+    /// The single gate every in-place write passes through. Offsets come out
+    /// of the file itself, so a corrupt DNG can aim one anywhere: a write past
+    /// EOF would punch a sparse hole (and its length change would permanently
+    /// defeat revert's guard), one inside the image data would corrupt pixels.
+    /// Overlapping patches are refused too — the journal couldn't undo them.
+    private mutating func patch(at offset: Int, _ bytes: Data, kind: PatchKind) throws {
+        guard !bytes.isEmpty, offset >= 0, offset <= originalLength - bytes.count else {
+            throw TIFFWriteError.corruptStructure
+        }
+        let end = offset + bytes.count
+        guard !patches.contains(where: { offset < $0.offset + $0.new.count && $0.offset < end }) else {
+            throw TIFFWriteError.corruptStructure
+        }
+        patches.append((offset, bytes, kind))
+    }
+
+    /// Bounds-checked read of the original bytes: the writer must never take a
+    /// range from a file-supplied offset on trust.
+    private func slice(_ start: Int, _ count: Int) throws -> Data {
+        guard start >= 0, count >= 0, start <= originalLength - count else {
+            throw TIFFWriteError.corruptStructure
+        }
+        return data.subdata(in: start..<(start + count))
+    }
+
+    /// TIFF offsets are 32-bit; a value that lands beyond 4 GB can't be
+    /// pointed at, so refuse instead of trapping on the conversion.
+    private func u32Offset(_ offset: Int) throws -> UInt32 {
+        guard offset >= 0, offset <= Int(UInt32.max) else { throw TIFFWriteError.fileTooLarge }
+        return UInt32(offset)
     }
 
     /// Adds bytes to the end-of-file appendix (word-aligned, as TIFF values
@@ -385,9 +453,9 @@ struct TIFFWriter {
 
     /// A 4-byte IFD value field: inline when the value fits, otherwise an
     /// offset to the value appended at end-of-file.
-    private mutating func valueField(for bytes: Data) -> Data {
+    private mutating func valueField(for bytes: Data) throws -> Data {
         if bytes.count <= 4 { return bytes.padded(to: 4) }
-        return u32Bytes(UInt32(append(bytes)))
+        return u32Bytes(try u32Offset(append(bytes)))
     }
 
     private func u16Bytes(_ v: UInt16) -> Data {
@@ -403,31 +471,47 @@ struct TIFFWriter {
 
     // MARK: - Journal & commit
 
+    /// Patches in the order `commit` writes them, so the journal describes the
+    /// file exactly as it will be left.
+    private var orderedPatches: [(offset: Int, new: Data, kind: PatchKind)] {
+        patches.filter { $0.kind == .value } + patches.filter { $0.kind == .pointer }
+    }
+
     private func journal(for url: URL) -> WriteJournal {
-        let recorded = patches.map { patch -> WritePatch in
-            let end = min(patch.offset + patch.new.count, originalLength)
-            let original = patch.offset < originalLength
-                ? data.subdata(in: patch.offset..<end)
-                : Data()
-            return WritePatch(offset: patch.offset, original: original, new: patch.new)
+        // patch(at:) guarantees every range lies inside the original file.
+        let recorded = orderedPatches.map { patch in
+            WritePatch(offset: patch.offset,
+                       original: data.subdata(in: patch.offset..<(patch.offset + patch.new.count)),
+                       new: patch.new)
         }
         return WriteJournal(filePath: url.path, date: Date(),
                             originalLength: originalLength,
                             patches: recorded, appendedBytes: appendix.count)
     }
 
+    /// Write ordering is the whole safety story here: a crash or a full disk
+    /// between two writes must never leave a pointer or count describing bytes
+    /// that aren't on disk. So the appendix lands and is flushed first, then
+    /// value bytes, then — last, after another flush — the pointers and counts
+    /// that describe them. A half-finished commit is then still a readable file
+    /// whose fields all point at real bytes.
     private func commit(to url: URL) throws {
         let handle = try FileHandle(forWritingTo: url)
         defer { try? handle.close() }
         if !appendix.isEmpty {
             try handle.seekToEnd()
             try handle.write(contentsOf: appendix)
+            try handle.synchronize()
         }
-        for patch in patches {
-            try handle.seek(toOffset: UInt64(patch.offset))
-            try handle.write(contentsOf: patch.new)
+        for kind in [PatchKind.value, .pointer] {
+            let group = patches.filter { $0.kind == kind }
+            guard !group.isEmpty else { continue }
+            for patch in group {
+                try handle.seek(toOffset: UInt64(patch.offset))
+                try handle.write(contentsOf: patch.new)
+            }
+            try handle.synchronize()
         }
-        try handle.synchronize()
     }
 }
 
