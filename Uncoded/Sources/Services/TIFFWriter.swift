@@ -48,6 +48,37 @@ struct LensWrite: Sendable {
     }
 }
 
+extension LensWrite {
+    /// Whether writing this lens would change anything the file already says.
+    ///
+    /// Comparing the claimed lens *name* is not enough to spot the case this
+    /// exists for: a frame fixed by v0.1.x claims exactly the right name beside
+    /// an empty `crs:LensProfileDigest`, and rewriting it is the only repair.
+    ///
+    /// Only the fields this write actually sets are compared. `xmpProperties`
+    /// skips empty values and writes no `crs:LensProfile*` at all for a lens
+    /// with no profile, so an empty value here changes nothing on disk and must
+    /// not read as a difference — otherwise a hand-typed lens would ask to be
+    /// rewritten forever.
+    func differs(from metadata: TIFFReader.LensMetadata) -> Bool {
+        func matches(_ value: String, _ current: String?) -> Bool {
+            let value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty else { return true }
+            return value == (current ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard matches(lensMake, metadata.lensMake),
+              matches(lensModel, metadata.lensModel),
+              // aux:Lens gets the model too; a half-landed fix leaves the two
+              // disagreeing, and that is a frame worth rewriting.
+              matches(lensModel, metadata.auxLens)
+        else { return true }
+        guard hasProfile else { return false }
+        return !(matches(profileName, metadata.profileName)
+            && matches(profileFilename, metadata.profileFilename)
+            && matches(profileDigest, metadata.profileDigest))
+    }
+}
+
 /// One in-place byte patch, with the original bytes for revert.
 struct WritePatch: Codable {
     let offset: Int

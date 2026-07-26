@@ -59,9 +59,8 @@ extension UserLens {
     /// `crs:LensProfileDigest` cannot be repaired by re-fixing them. Recognising
     /// the app's own output closes that door.
     ///
-    /// Intended wiring, once the scan branches have merged: where the scan asks
-    /// `SixBitTable` for the lens identity behind `lensModel` and gets nothing,
-    /// it should fall back to this. A frame that claims one of the user's own
+    /// So `ScanView`'s scan plan falls back to this wherever `SixBitTable`
+    /// found no candidate at all: a frame that claims one of the user's own
     /// lenses is not "unrecognised" — it is already assigned to that lens, and
     /// re-fixing it is the repair path for anything an older version got wrong.
     static func claiming(name: String?, in lenses: [UserLens]) -> UserLens? {

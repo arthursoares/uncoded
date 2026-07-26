@@ -6,6 +6,10 @@ import SwiftData
 struct Resolution {
     let lens: UserLens?
     let isManual: Bool
+    /// True when the file's own metadata already claims this lens — a frame
+    /// Uncoded (or an older version of it) has fixed before, whether or not an
+    /// undo journal survived to seal it.
+    var isClaimed = false
 }
 
 /// Per-file fix outcome for the current session.

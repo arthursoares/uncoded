@@ -35,4 +35,18 @@ final class ScanSessionTests: XCTestCase {
         XCTAssertTrue(FrameFix.revertRefused("changed").isFixed,
                       "the bytes on disk are still ours")
     }
+
+    // MARK: - Resolution
+
+    /// A frame resolved from the file's own claim is not a manual override —
+    /// the distinction is what keeps the "manual" tag honest.
+    func testAClaimedResolutionIsNotAManualOne() {
+        let lens = UserLens(name: "Voigtlander VM 35mm f/2 Ultron Aspherical",
+                            make: "Voigtlander")
+        let claimed = Resolution(lens: lens, isManual: false, isClaimed: true)
+        XCTAssertFalse(claimed.isManual)
+        XCTAssertTrue(claimed.isClaimed)
+        XCTAssertFalse(Resolution(lens: lens, isManual: true).isClaimed,
+                       "an override says nothing about what the file claims")
+    }
 }

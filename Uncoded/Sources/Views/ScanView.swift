@@ -46,7 +46,7 @@ struct ScanView: View {
         private(set) var failureCount = 0
         private(set) var unclaimedCodes: [String: Int] = [:]
 
-        init(session: ScanSession, mappings: [CodeMapping]) {
+        init(session: ScanSession, mappings: [CodeMapping], lenses: [UserLens]) {
             // The lens each mapped code points at. First row wins per code.
             var lensByCode: [String: UserLens] = [:]
             var seen = Set<String>()
@@ -55,13 +55,26 @@ struct ScanView: View {
             }
 
             for file in session.results {
+                // A file whose name matches no code at all may still name one
+                // of the user's own lenses — Uncoded's own output, read back.
+                // Only frames with nothing for the code table to say are asked:
+                // where there are candidates, they and the mappings decide, and
+                // an ambiguity is an ambiguity.
+                let claimed = file.codeCandidates.isEmpty
+                    ? UserLens.claiming(file.meta, in: lenses) : nil
+
                 let resolution: Resolution
                 if let manual = session.overrides[file.url] {
-                    resolution = Resolution(lens: manual, isManual: true)
+                    resolution = Resolution(lens: manual, isManual: true,
+                                            isClaimed: claimed != nil)
                 } else if let lens = file.mappedLens({ lensByCode[$0] }) {
                     // When the camera string can't say which generation it is,
                     // the codes the user mapped say which lens they engraved.
                     resolution = Resolution(lens: lens, isManual: false)
+                } else if let claimed {
+                    // Already assigned, by the file itself. Not an override and
+                    // not a coded frame — just one Uncoded has been here before.
+                    resolution = Resolution(lens: claimed, isManual: false, isClaimed: true)
                 } else {
                     resolution = Resolution(lens: nil, isManual: false)
                 }
@@ -75,7 +88,7 @@ struct ScanView: View {
                 if let code = file.matchedCode?.code, resolution.lens == nil, state == nil {
                     unclaimedCodes[code, default: 0] += 1
                 }
-                if let target = Self.target(file: file, lens: resolution.lens, state: state) {
+                if let target = Self.target(file: file, resolution: resolution, state: state) {
                     targets.append(target)
                     targetByURL[file.url] = target
                 }
@@ -83,22 +96,25 @@ struct ScanView: View {
         }
 
         /// Frames that resolve to a lens and still need a write: never fixed,
-        /// a failed write worth retrying (nothing was committed), or a fixed
-        /// frame whose lens no longer matches what the file claims.
-        private static func target(file: ScannedDNG, lens: UserLens?,
+        /// a failed write worth retrying (nothing was committed), or an
+        /// already-fixed frame the current fix would not write the same way.
+        ///
+        /// "Already fixed" is a seal *or* a file that claims one of the user's
+        /// lenses under its own steam: a frame fixed by v0.1.x whose journal is
+        /// long gone reads as untouched, and rewriting it is how its empty
+        /// profile digest gets repaired.
+        private static func target(file: ScannedDNG, resolution: Resolution,
                                    state: FrameFix?) -> FixTarget? {
-            guard let lens else { return nil }
+            guard let lens = resolution.lens else { return nil }
+            let alreadyWritten = state?.isFixed == true || resolution.isClaimed
             switch state {
-            case nil:
-                return FixTarget(file: file, lens: lens, kind: .first)
             case .failed:
                 return FixTarget(file: file, lens: lens, kind: .retry)
-            case .fixed, .revertRefused:
-                // The reader trims what it reads, so compare trimmed.
-                let claimed = file.claimedLens?.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard claimed != lens.name.trimmingCharacters(in: .whitespacesAndNewlines) else {
-                    return nil
-                }
+            case nil where !alreadyWritten:
+                return FixTarget(file: file, lens: lens, kind: .first)
+            default:
+                // The name alone can't see a v0.1.x fix with an empty digest.
+                guard lens.lensWrite.differs(from: file.meta) else { return nil }
                 return FixTarget(file: file, lens: lens, kind: .refix)
             }
         }
@@ -153,7 +169,7 @@ struct ScanView: View {
     }
 
     var body: some View {
-        let plan = ScanPlan(session: session, mappings: mappings)
+        let plan = ScanPlan(session: session, mappings: mappings, lenses: lenses)
         VStack(spacing: 0) {
             if session.results.isEmpty && !session.scanning {
                 emptyState
@@ -619,7 +635,10 @@ struct ScanView: View {
         }
         let refixes = targets.filter { $0.kind == .refix }.count
         if refixes > 0 && refixes < targets.count {
-            lines.append("\(refixes) of them \(refixes == 1 ? "was" : "were") already fixed and will be rewritten with the newly assigned lens.")
+            // Re-assigned by hand, or fixed by a version that wrote less than
+            // this one does — either way, the file no longer says what a fix
+            // would say.
+            lines.append("\(refixes) of them \(refixes == 1 ? "was" : "were") already fixed and will be rewritten: what Uncoded writes now differs from what the file\(refixes == 1 ? "" : "s") already \(refixes == 1 ? "carries" : "carry").")
         }
         let retries = targets.filter { $0.kind == .retry }.count
         if retries > 0 && retries < targets.count {
@@ -949,18 +968,7 @@ private struct FrameCell: View {
                         .lineLimit(4)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                if let refixLens {
-                    HStack(spacing: 4) {
-                        Image(systemName: "arrow.triangle.2.circlepath")
-                            .font(.system(size: 8))
-                            .foregroundStyle(Theme.rebate)
-                        Text(refixLens.name)
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundStyle(Theme.rebate)
-                            .lineLimit(1)
-                        EngravedLabel("re-fix", color: Theme.rebate)
-                    }
-                }
+                refixRow
             case .failed(let message):
                 HStack(spacing: 4) {
                     Image(systemName: "exclamationmark.triangle.fill")
@@ -997,6 +1005,26 @@ private struct FrameCell: View {
                             .lineLimit(1)
                     }
                 }
+                // A frame Uncoded fixed before its journal was lost has no
+                // seal, so its rewrite has to announce itself here.
+                refixRow
+            }
+        }
+    }
+
+    /// The lens a frame is about to be rewritten to.
+    @ViewBuilder
+    private var refixRow: some View {
+        if let refixLens {
+            HStack(spacing: 4) {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .font(.system(size: 8))
+                    .foregroundStyle(Theme.rebate)
+                Text(refixLens.name)
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(Theme.rebate)
+                    .lineLimit(1)
+                EngravedLabel("re-fix", color: Theme.rebate)
             }
         }
     }
@@ -1023,7 +1051,9 @@ private struct FrameCell: View {
             break
         }
         if let refixLens {
-            lines.append("re-assigned to \(refixLens.name) — Fix rewrites this frame")
+            lines.append(resolution.isClaimed && !resolution.isManual
+                ? "already carries \(refixLens.name), but not everything this version writes — Fix rewrites this frame"
+                : "re-assigned to \(refixLens.name) — Fix rewrites this frame")
         }
         return lines.joined(separator: "\n")
     }
@@ -1038,6 +1068,23 @@ private struct ScanRow: View {
     let refixLens: UserLens?
 
     private var warnings: [String] { fix?.warnings ?? [] }
+
+    /// The lens a frame is about to be rewritten to.
+    @ViewBuilder
+    private var refixRow: some View {
+        if let refixLens {
+            HStack(spacing: 5) {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .font(.system(size: 8))
+                    .foregroundStyle(Theme.rebate)
+                Text(refixLens.name)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Theme.rebate)
+                    .lineLimit(1)
+                EngravedLabel("re-fix", color: Theme.rebate)
+            }
+        }
+    }
 
     var body: some View {
         HStack(spacing: 14) {
@@ -1086,18 +1133,7 @@ private struct ScanRow: View {
                                 .fixedSize(horizontal: false, vertical: true)
                         }
                     }
-                    if let refixLens {
-                        HStack(spacing: 5) {
-                            Image(systemName: "arrow.triangle.2.circlepath")
-                                .font(.system(size: 8))
-                                .foregroundStyle(Theme.rebate)
-                            Text(refixLens.name)
-                                .font(.system(size: 11, weight: .medium))
-                                .foregroundStyle(Theme.rebate)
-                                .lineLimit(1)
-                            EngravedLabel("re-fix", color: Theme.rebate)
-                        }
-                    }
+                    refixRow
                 case .failed(let message):
                     HStack(spacing: 5) {
                         EngravedLabel("failed", color: Theme.accent)
@@ -1125,6 +1161,9 @@ private struct ScanRow: View {
                             .font(.system(size: 10))
                             .foregroundStyle(Theme.faint)
                     }
+                    // A frame fixed before its journal was lost has no seal, so
+                    // its rewrite has to announce itself here.
+                    refixRow
                 }
             }
             Spacer()

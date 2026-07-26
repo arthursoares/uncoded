@@ -900,6 +900,33 @@ final class TIFFWriterTests: XCTestCase {
                        "03CBD374CCB89A292AD832BB830E440F")
     }
 
+    /// The scan asks "would fixing this again write anything new?" of every
+    /// frame that already carries our metadata. A write that still reads as
+    /// different from its own result would put the frame in the fix set on
+    /// every scan, for ever.
+    func testAWriteDoesNotDifferFromItsOwnResult() throws {
+        let url = try writeTemp(makeTIFF(xmp: sampleXMP).data)
+        XCTAssertTrue(voigtlander.differs(from: try TIFFReader.read(url: url)),
+                      "an untouched frame is nothing like the write")
+        _ = try TIFFWriter.apply(voigtlander, to: url)
+        XCTAssertFalse(voigtlander.differs(from: try TIFFReader.read(url: url)),
+                       "re-fixing this frame would change nothing")
+    }
+
+    /// How a frame fixed by v0.1.x becomes repairable: same name on the file,
+    /// but the digest the lens now has never made it in.
+    func testAFixWithNoDigestStillDiffersOnceTheDigestIsKnown() throws {
+        var v0 = voigtlander
+        v0.profileDigest = ""
+        let url = try writeTemp(makeTIFF(xmp: sampleXMP).data)
+        _ = try TIFFWriter.apply(v0, to: url)
+
+        let metadata = try TIFFReader.read(url: url)
+        XCTAssertFalse(v0.differs(from: metadata), "nothing new for the old write to say")
+        XCTAssertTrue(voigtlander.differs(from: metadata),
+                      "the digest is the repair, and the name alone can't see it")
+    }
+
     func testNoProfileMeansNoCRSBlockAtAll() throws {
         // A hand-typed lens names no Adobe profile. LensProfileSetup="Custom"
         // beside an empty Digest/Filename/Name is a reference to nothing.
@@ -983,6 +1010,10 @@ final class TIFFWriterTests: XCTestCase {
         }
         XCTAssertTrue(readout.contains("XMP-aux]       LensInfo"),
                       "XMP-aux:LensInfo must be written too:\n\(readout)")
+        // On a real M11 packet too: a second scan must not offer to re-fix
+        // the frame the first one just fixed.
+        XCTAssertFalse(voigtlander.differs(from: try TIFFReader.read(url: url)),
+                       "re-fixing this frame would change nothing")
 
         try TIFFWriter.revert(journal)
         XCTAssertEqual(try Data(contentsOf: url), try Data(contentsOf: URL(fileURLWithPath: source)))
