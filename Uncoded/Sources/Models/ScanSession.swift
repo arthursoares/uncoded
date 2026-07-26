@@ -84,6 +84,10 @@ final class ScanSession {
     var selection = Set<URL>()
     var overrides: [URL: UserLens] = [:]
     var fixState: [URL: FrameFix] = [:]
+    /// Frames sealed by content rather than by path, and the filename their
+    /// journal recorded — a fix that Lightroom renamed on import can then say
+    /// so instead of looking like it belongs to a file that no longer exists.
+    var renamedFrom: [URL: String] = [:]
 
     var busy: ScanBusy?
     var fixProgress: (done: Int, total: Int)?

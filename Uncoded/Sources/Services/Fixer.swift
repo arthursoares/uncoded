@@ -64,6 +64,10 @@ struct JournalStore: Sendable {
 
     static func fixedPaths() -> Set<String> { `default`.fixedPaths() }
 
+    static func sealedURLs(in candidates: [URL]) -> SealResult {
+        `default`.sealedURLs(in: candidates)
+    }
+
     static func journal(for file: URL) -> JournalRecord? { `default`.journal(for: file) }
 
     // MARK: - Reading
@@ -218,12 +222,9 @@ struct JournalStore: Sendable {
     /// when two of a scan's files answer to one journal — a seal promises an
     /// undo, and only one of them can have it.
     ///
-    /// Intended ScanView wiring (the integration pass, not this PR): in
-    /// `scan`, replace `JournalStore.fixedPaths()` with
-    /// `sealedURLs(in: found.map(\.url))` and seal
-    /// `result.sealed.contains(file.url)`; `result.renamedFrom[url]` gives the
-    /// filename the journal recorded, worth printing on the frame's seal so a
-    /// renamed frame explains itself.
+    /// `ScanView.scan` seals `result.sealed` and keeps `result.renamedFrom` in
+    /// the session, so a frame sealed by content says which filename it was
+    /// fixed under.
     func sealedURLs(in candidates: [URL]) -> SealResult {
         let index = index()
         var result = SealResult()

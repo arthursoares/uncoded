@@ -358,6 +358,7 @@ struct ScanView: View {
                              resolve: plan.resolution(for:),
                              fixInfo: { session.fixState[$0.url] },
                              refixLens: plan.refixLens(for:),
+                             renamedFrom: { session.renamedFrom[$0.url] },
                              isSelected: { session.selection.contains($0.url) },
                              onTap: { toggleMark($0) },
                              onAssign: { assignMenu(for: [$0.url]) },
@@ -767,14 +768,19 @@ struct ScanView: View {
         session.selection = []
         session.overrides = [:]
         session.fixState = [:]
+        session.renamedFrom = [:]
         session.unreadableCount = 0
         session.skippedSubfolders = 0
         session.folderReadable = true
         session.showFailuresOnly = false
         session.lastRunSummary = nil
         Task {
-            let (outcome, journaled) = await Task.detached(priority: .userInitiated) {
-                (DNGScanner.scan(folder: url), JournalStore.fixedPaths())
+            let (outcome, seals) = await Task.detached(priority: .userInitiated) {
+                let outcome = DNGScanner.scan(folder: url)
+                // By content, not just by path: a fixed frame Lightroom renamed
+                // on import has no journal at its new name, and matching the
+                // bytes is what keeps its undo reachable.
+                return (outcome, JournalStore.sealedURLs(in: outcome.files.map(\.url)))
             }.value
             session.results = outcome.files
             session.unreadableCount = outcome.unreadable
@@ -782,9 +788,10 @@ struct ScanView: View {
             session.folderReadable = outcome.folderReadable
             // Files with a persisted journal were fixed in an earlier session —
             // restore their FIXED seals so revert stays reachable.
-            for file in outcome.files where journaled.contains(file.url.path) {
+            for file in outcome.files where seals.sealed.contains(file.url) {
                 session.fixState[file.url] = .fixed(warnings: [])
             }
+            session.renamedFrom = seals.renamedFrom
             session.scanning = false
         }
     }
@@ -800,6 +807,7 @@ private struct ContactSheet<AssignMenu: View>: View {
     let resolve: (ScannedDNG) -> Resolution
     let fixInfo: (ScannedDNG) -> FrameFix?
     let refixLens: (ScannedDNG) -> UserLens?
+    let renamedFrom: (ScannedDNG) -> String?
     let isSelected: (ScannedDNG) -> Bool
     let onTap: (ScannedDNG) -> Void
     @ViewBuilder let onAssign: (ScannedDNG) -> AssignMenu
@@ -817,6 +825,7 @@ private struct ContactSheet<AssignMenu: View>: View {
                               resolution: resolve(file),
                               fix: fixInfo(file),
                               refixLens: refixLens(file),
+                              renamedFrom: renamedFrom(file),
                               selected: isSelected(file))
                         .onTapGesture { onTap(file) }
                         .contextMenu {
@@ -843,6 +852,7 @@ private struct FrameCell: View {
     let resolution: Resolution
     let fix: FrameFix?
     let refixLens: UserLens?
+    let renamedFrom: String?
     let selected: Bool
 
     @State private var image: NSImage?
@@ -1000,7 +1010,8 @@ private struct FrameCell: View {
         }
         switch fix {
         case .fixed(let warnings):
-            lines.append("fixed — right-click to revert")
+            lines.append(renamedFrom.map { "fixed as \($0), renamed since — right-click to revert" }
+                ?? "fixed — right-click to revert")
             lines.append(contentsOf: warnings)
         case .revertRefused(let message):
             lines.append("still fixed; revert refused: \(message)")
