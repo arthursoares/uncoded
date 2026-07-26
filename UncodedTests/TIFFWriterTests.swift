@@ -913,6 +913,29 @@ final class TIFFWriterTests: XCTestCase {
                        "re-fixing this frame would change nothing")
     }
 
+    /// The characters XML has to escape are the ones that used to make a frame
+    /// disagree with itself: written as `&amp;`, read back as `&amp;`, and so
+    /// flagged for a rewrite on every scan for ever — a FIXED seal and a RE-FIX
+    /// row on the same frame, and a fresh journal record per Fix run.
+    func testANameNeedingXMLEscapingRoundTrips() throws {
+        for name in ["Cooke & Sons 50mm f/2", "MS Optical <Sonnetar> 50mm f/1.1",
+                     #"7Artisans 35mm f/1.4 "M""#, "Zeiss C Biogon 35mm f/2.8 'ZM'"] {
+            var write = voigtlander
+            write.lensModel = name
+            write.profileName = "Adobe (\(name))"
+
+            let url = try writeTemp(makeTIFF(xmp: sampleXMP).data)
+            _ = try TIFFWriter.apply(write, to: url)
+
+            let metadata = try TIFFReader.read(url: url)
+            XCTAssertEqual(metadata.auxLens, name, "the tooltip shows this text")
+            XCTAssertEqual(metadata.lensModel, name)
+            XCTAssertEqual(metadata.profileName, "Adobe (\(name))")
+            XCTAssertFalse(write.differs(from: metadata),
+                           "\(name) would be rewritten on every scan")
+        }
+    }
+
     /// How a frame fixed by v0.1.x becomes repairable: same name on the file,
     /// but the digest the lens now has never made it in.
     func testAFixWithNoDigestStillDiffersOnceTheDigestIsKnown() throws {

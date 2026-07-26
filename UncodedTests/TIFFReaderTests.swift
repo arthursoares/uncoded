@@ -90,6 +90,47 @@ final class TIFFReaderTests: XCTestCase {
         XCTAssertEqual(TIFFReader.xmpValue(xmp, property: "aux:Lens"), "Some Lens")
     }
 
+    // MARK: - XML text is escaped text
+
+    /// A value read back raw is not the value that was written: the writer
+    /// serializes through XMLDocument, so an ampersand in a lens name arrives
+    /// as `&amp;` and the frame reads as different from itself for ever.
+    func testXMPValueIsUnescaped() {
+        let attribute = #"<rdf:Description aux:Lens="Cooke &amp; Sons &lt;M&gt;"/>"#
+        XCTAssertEqual(TIFFReader.xmpValue(attribute, property: "aux:Lens"),
+                       "Cooke & Sons <M>")
+        let element = "<rdf:Description><aux:Lens>7Artisans 35mm f/1.4 &quot;M&quot;</aux:Lens></rdf:Description>"
+        XCTAssertEqual(TIFFReader.xmpValue(element, property: "aux:Lens"),
+                       "7Artisans 35mm f/1.4 \"M\"")
+    }
+
+    func testNamedAndNumericReferencesBothDecode() {
+        XCTAssertEqual(TIFFReader.unescapedXML("&amp;&lt;&gt;&quot;&apos;"), "&<>\"'")
+        // The writer emits these itself, for whitespace attribute-value
+        // normalization would otherwise eat.
+        XCTAssertEqual(TIFFReader.unescapedXML("a&#xA;b&#xD;c&#x9;d"), "a\nb\rc\td")
+        XCTAssertEqual(TIFFReader.unescapedXML("&#65;&#x42;&#X43;"), "ABC")
+    }
+
+    /// One left-to-right pass: decoding `&amp;` and then `&lt;` would turn
+    /// escaped text into markup that was never in the file.
+    func testEscapedEscapesDoNotDoubleDecode() {
+        XCTAssertEqual(TIFFReader.unescapedXML("&amp;lt;"), "&lt;")
+        XCTAssertEqual(TIFFReader.unescapedXML("&amp;amp;"), "&amp;")
+    }
+
+    /// An ampersand that names nothing is an ampersand somebody typed.
+    func testUnknownAndBareAmpersandsSurviveVerbatim() {
+        XCTAssertEqual(TIFFReader.unescapedXML("Cooke & Sons; est. 1893"),
+                       "Cooke & Sons; est. 1893")
+        XCTAssertEqual(TIFFReader.unescapedXML("&frac12;"), "&frac12;")
+        XCTAssertEqual(TIFFReader.unescapedXML("&"), "&")
+        XCTAssertEqual(TIFFReader.unescapedXML("&;"), "&;")
+        XCTAssertEqual(TIFFReader.unescapedXML("&#xD800;"), "&#xD800;",
+                       "a lone surrogate is not a character")
+        XCTAssertEqual(TIFFReader.unescapedXML("no entities here"), "no entities here")
+    }
+
     // MARK: - Real files (runs only when UNCODED_TEST_DNG points at one)
 
     func testAgainstRealDNGIfProvided() throws {
