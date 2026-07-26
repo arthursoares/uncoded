@@ -44,7 +44,10 @@ struct ScanView: View {
         private(set) var mappedCount = 0
         private(set) var fixedCount = 0
         private(set) var failureCount = 0
-        private(set) var unclaimedCodes: [String: Int] = [:]
+        /// Codes no lens of the user's claims, keyed by the candidate list of
+        /// the frames wearing them — one entry per code normally, and one per
+        /// pair when the camera's lens name fits more than one code.
+        private(set) var unclaimedCodes: [[String]: Int] = [:]
 
         init(session: ScanSession, mappings: [CodeMapping], lenses: [UserLens]) {
             // The lens each mapped code points at. First row wins per code.
@@ -81,12 +84,14 @@ struct ScanView: View {
                 resolutions[file.url] = resolution
 
                 let state = session.fixState[file.url]
-                if file.matchedCode != nil { codedCount += 1 }
+                // A frame whose name fits two codes wears a code either way —
+                // which one is the open question, not whether.
+                if !file.codeCandidates.isEmpty { codedCount += 1 }
                 if resolution.lens != nil { mappedCount += 1 }
                 if state?.isFixed == true { fixedCount += 1 }
                 if state?.isFailure == true { failureCount += 1 }
-                if let code = file.matchedCode?.code, resolution.lens == nil, state == nil {
-                    unclaimedCodes[code, default: 0] += 1
+                if resolution.lens == nil, state == nil, !file.codeCandidates.isEmpty {
+                    unclaimedCodes[file.codeCandidates.map(\.code), default: 0] += 1
                 }
                 if let target = Self.target(file: file, resolution: resolution, state: state) {
                     targets.append(target)
@@ -129,10 +134,14 @@ struct ScanView: View {
             return target.lens
         }
 
-        /// The most frequent unclaimed code — the one to suggest claiming first.
-        var topUnclaimedCode: (code: String, count: Int)? {
-            guard let best = unclaimedCodes.max(by: { ($0.value, $1.key) < ($1.value, $0.key) })
-            else { return nil }
+        /// The most frequent unclaimed code — the one to suggest claiming
+        /// first. More than one code means the frames' lens name fits several
+        /// and the file records none of them; the banner offers all of them
+        /// rather than picking.
+        var topUnclaimedCode: (codes: [String], count: Int)? {
+            guard let best = unclaimedCodes.max(by: {
+                ($0.value, $1.key.joined()) < ($1.value, $0.key.joined())
+            }) else { return nil }
             return (best.key, best.value)
         }
     }
@@ -516,26 +525,64 @@ struct ScanView: View {
     }
 
     /// The road out of the "0 mapped" dead end: an unclaimed code with a
-    /// direct route to claiming it.
-    private func unclaimedBanner(_ top: (code: String, count: Int)) -> some View {
+    /// direct route to claiming it. When the camera's lens name fits more than
+    /// one code the frames are just as unclaimed, so they get the same banner —
+    /// with every candidate on offer, since only the user knows which one is
+    /// engraved on the lens.
+    private func unclaimedBanner(_ top: (codes: [String], count: Int)) -> some View {
         HStack(spacing: 10) {
-            BitPatternView(code: top.code, dotSize: 7)
-            Text("\(top.count) frame\(top.count == 1 ? "" : "s") wear\(top.count == 1 ? "s" : "") code \(top.code) — not claimed by any of your lenses yet")
+            HStack(spacing: 8) {
+                ForEach(Array(top.codes.enumerated()), id: \.element) { index, code in
+                    if index > 0 { EngravedLabel("or", color: Theme.rebate.opacity(0.7)) }
+                    BitPatternView(code: code, dotSize: 7)
+                }
+            }
+            Text(unclaimedText(top))
                 .font(.system(size: 11))
                 .foregroundStyle(Theme.rebate)
             Spacer()
-            if !lenses.isEmpty {
-                Button("Map to a Lens…") { codeToMap = top.code }
+            if let code = top.codes.first, top.codes.count == 1 {
+                if !lenses.isEmpty {
+                    Button("Map to a Lens…") { codeToMap = code }
+                        .controlSize(.small)
+                }
+                Button("Add Lens…") { addLensCode = code }
                     .controlSize(.small)
-            }
-            Button("Add Lens…") { addLensCode = top.code }
+                    .buttonStyle(.borderedProminent)
+                    .tint(Theme.accent)
+            } else {
+                if !lenses.isEmpty {
+                    Menu("Map a Code…") {
+                        ForEach(top.codes, id: \.self) { code in
+                            Button("Code \(code)…") { codeToMap = code }
+                        }
+                    }
+                    .menuStyle(.borderedButton)
+                    .controlSize(.small)
+                    .fixedSize()
+                }
+                Menu("Add Lens…") {
+                    ForEach(top.codes, id: \.self) { code in
+                        Button("With code \(code)…") { addLensCode = code }
+                    }
+                }
+                .menuStyle(.borderedButton)
                 .controlSize(.small)
-                .buttonStyle(.borderedProminent)
-                .tint(Theme.accent)
+                .fixedSize()
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
         .background(Theme.rebate.opacity(0.08))
+    }
+
+    private func unclaimedText(_ top: (codes: [String], count: Int)) -> String {
+        let subject = "\(top.count) frame\(top.count == 1 ? "" : "s") wear\(top.count == 1 ? "s" : "")"
+        guard top.codes.count > 1 else {
+            return "\(subject) code \(top.codes.first ?? "") — not claimed by any of your lenses yet"
+        }
+        let fits = top.codes.count == 2 ? "either" : "any of them"
+        return "\(subject) code \(top.codes.joined(separator: " or ")) — the camera's lens name fits \(fits), so Uncoded won't guess; map the one you engraved"
     }
 
     /// Grease-pencil action bar for the marked frames.
@@ -852,9 +899,15 @@ private struct ContactSheet<AssignMenu: View>: View {
                             if fixInfo(file)?.isFixed == true {
                                 Divider()
                                 Button("Revert Fix…") { onRevert(file) }
-                            } else if let code = file.matchedCode?.code, resolve(file).lens == nil {
+                            } else if resolve(file).lens == nil, !file.codeCandidates.isEmpty {
+                                // Every candidate, never a guess: two codes fit
+                                // the name and only the lens itself knows which.
                                 Divider()
-                                Button("Map Code \(code) to a Lens…") { onMapCode(code) }
+                                ForEach(file.codeCandidates, id: \.code) { candidate in
+                                    Button("Map Code \(candidate.code) to a Lens…") {
+                                        onMapCode(candidate.code)
+                                    }
+                                }
                             }
                         }
                 }
@@ -998,6 +1051,13 @@ private struct FrameCell: View {
                         Text("code not mapped")
                             .font(.system(size: 9))
                             .foregroundStyle(Theme.faint)
+                    } else if file.codeCandidates.count > 1 {
+                        // Coded, but the name fits several codes and the file
+                        // records none of them. Say so rather than read as
+                        // uncoded; the tooltip names the candidates.
+                        Text("\(file.codeCandidates.count) possible codes — none mapped")
+                            .font(.system(size: 9))
+                            .foregroundStyle(Theme.faint)
                     } else {
                         Text(file.claimedLens ?? "no lens metadata")
                             .font(.system(size: 9))
@@ -1032,7 +1092,18 @@ private struct FrameCell: View {
     private var helpText: String {
         var lines = [file.filename]
         if let claimed = file.claimedLens { lines.append("claims: \(claimed)") }
-        if let code = file.matchedCode { lines.append("code \(code.code) — \(code.lensName)") }
+        if let code = file.matchedCode {
+            lines.append("code \(code.code) — \(code.lensName)")
+        } else if file.codeCandidates.count > 1 {
+            for candidate in file.codeCandidates {
+                lines.append("code \(candidate.code) — \(candidate.lensName)")
+            }
+            lines.append("""
+            the camera's lens name fits all of these and the file records none \
+            of them, so Uncoded won't guess — right-click to map the code you \
+            actually engraved.
+            """)
+        }
         if let lens = resolution.lens {
             lines.append("actually: \(lens.name)\(resolution.isManual ? " (manual)" : "")")
         }
@@ -1158,6 +1229,12 @@ private struct ScanRow: View {
                         }
                     } else if file.matchedCode != nil {
                         Text("code not mapped to one of your lenses")
+                            .font(.system(size: 10))
+                            .foregroundStyle(Theme.faint)
+                    } else if file.codeCandidates.count > 1 {
+                        // The name fits several codes and the file records none
+                        // of them — coded, but not to a code we may pick.
+                        Text("code \(file.codeCandidates.map(\.code).joined(separator: " or ")) — Uncoded won't guess which")
                             .font(.system(size: 10))
                             .foregroundStyle(Theme.faint)
                     }
