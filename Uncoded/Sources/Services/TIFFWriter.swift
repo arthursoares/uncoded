@@ -9,6 +9,107 @@ struct LensWrite: Sendable {
     var profileName: String
     var profileFilename: String
     var profileDigest: String
+
+    /// Whether this lens names an Adobe correction profile at all. A lens the
+    /// user typed in by hand names none — and then there is nothing truthful to
+    /// put in `crs:LensProfile*`.
+    var hasProfile: Bool {
+        !(profileName.isEmpty && profileFilename.isEmpty && profileDigest.isEmpty)
+    }
+
+    /// XMP `aux:LensInfo`: min focal, max focal, min aperture, max aperture as
+    /// space-separated rationals — the XMP twin of EXIF LensSpecification.
+    ///
+    /// The CLI's `exiftool -LensInfo=` populated *both* ExifIFD:LensInfo and
+    /// XMP-aux:LensInfo. Writing only the EXIF one leaves the camera's original
+    /// aux:LensInfo in place, which describes the *borrowed* Leica lens —
+    /// usually at the wrong maximum aperture — and that is the copy Lightroom
+    /// shows.
+    var xmpLensInfo: String? {
+        guard let focal = focalMM, let aperture = apertureF,
+              let f = Self.rational(focal), let a = Self.rational(aperture)
+        else { return nil }
+        return "\(f) \(f) \(a) \(a)"
+    }
+
+    /// What EXIF LensSpecification will read as once this write lands, in the
+    /// reader's own rendering. Nil when the lens has no usable numbers — then
+    /// the write leaves FocalLength and LensSpecification alone.
+    ///
+    /// Quantized the way `setRationals` quantizes: it stores every value over a
+    /// denominator of 1000, so a lens with a fourth decimal place comes back off
+    /// the grid it went on. Comparing the raw value against the rounded one on
+    /// disk would leave that lens asking to be rewritten for ever.
+    var lensSpecText: String? {
+        guard let focal = focalMM, let aperture = apertureF,
+              focal.isFinite, aperture.isFinite,
+              focal > 0, aperture > 0, focal <= 1_000_000, aperture <= 1_000_000
+        else { return nil }
+        let stored = { (v: Double) in (v * 1000).rounded() / 1000 }
+        return TIFFReader.lensSpecText(minFocal: stored(focal), maxFocal: stored(focal),
+                                       aperture: stored(aperture))
+    }
+
+    /// The shortest exact rational for a lens number: 35 → "35/1", 1.8 → "18/10".
+    /// Unreduced denominators are valid XMP and are what Lightroom writes.
+    private static func rational(_ v: Double) -> String? {
+        guard v.isFinite, v > 0, v <= 1_000_000 else { return nil }
+        var denominator = 1
+        while denominator <= 1000 {
+            let scaled = v * Double(denominator)
+            if abs(scaled - scaled.rounded()) < 1e-6, scaled <= Double(UInt32.max) {
+                return "\(Int(scaled.rounded()))/\(denominator)"
+            }
+            denominator *= 10
+        }
+        return nil
+    }
+}
+
+extension LensWrite {
+    /// Whether writing this lens would change anything the file already says.
+    ///
+    /// Comparing the claimed lens *name* is not enough to spot the case this
+    /// exists for: a frame fixed by v0.1.x claims exactly the right name beside
+    /// an empty `crs:LensProfileDigest`, and rewriting it is the only repair.
+    ///
+    /// Only the fields this write actually sets are compared, and only where it
+    /// would set them to something: `xmpProperties` skips empty values and
+    /// writes no `crs:LensProfile*` at all for a lens with no profile, so an
+    /// empty value here changes nothing on disk and must not read as a
+    /// difference — otherwise a hand-typed lens would ask to be rewritten
+    /// forever.
+    ///
+    /// Which is also why an orphan `crs:LensProfileSetup="Custom"` — what
+    /// v0.1.1 left on a no-profile lens, a profile reference naming nothing —
+    /// is *not* counted as a difference, however much it deserves to be: the
+    /// writer only ever sets properties, so a fix cannot clear it, and flagging
+    /// a state no fix can reach is a frame that asks to be rewritten for ever.
+    /// Repairing those files needs the writer to learn to remove a property.
+    func differs(from metadata: TIFFReader.LensMetadata) -> Bool {
+        func matches(_ value: String, _ current: String?) -> Bool {
+            let value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty else { return true }
+            return value == (current ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard matches(lensMake, metadata.lensMake),
+              matches(lensModel, metadata.lensModel),
+              // aux:Lens gets the model too; a half-landed fix leaves the two
+              // disagreeing, and that is a frame worth rewriting.
+              matches(lensModel, metadata.auxLens),
+              // The focal length and maximum aperture, in EXIF and in the XMP
+              // copy Lightroom actually shows. v0.1.1 wrote only the EXIF one,
+              // leaving aux:LensInfo describing the borrowed Leica lens at its
+              // wrong maximum aperture — for a lens with no Adobe profile that
+              // is the whole of what a repair has to put right.
+              matches(lensSpecText ?? "", metadata.lensSpec),
+              matches(xmpLensInfo ?? "", metadata.auxLensInfo)
+        else { return true }
+        guard hasProfile else { return false }
+        return !(matches(profileName, metadata.profileName)
+            && matches(profileFilename, metadata.profileFilename)
+            && matches(profileDigest, metadata.profileDigest))
+    }
 }
 
 /// One in-place byte patch, with the original bytes for revert.
@@ -20,18 +121,151 @@ struct WritePatch: Codable {
 
 /// Everything needed to undo a write: restore the patched bytes and truncate
 /// away whatever was appended at end-of-file.
+///
+/// The patches plus `sample` double as a content fingerprint: enough to
+/// identify the file this journal belongs to — so a fixed file renamed after
+/// the fix is still recognised — without hashing a 100 MB raw.
 struct WriteJournal: Codable {
     let filePath: String
     let date: Date
     let originalLength: Int
     let patches: [WritePatch]
     let appendedBytes: Int
+    // Added in v0.2. Optional, so journals written by v0.1.x still decode —
+    // and so v0.1.x still decodes these (it ignores the extra keys).
+    var originalFileName: String?
+    var state: State?
+    var bak: BakRecord?
+    var sample: ContentSample?
+
+    /// A journal is written before the bytes change, so a record on disk does
+    /// not by itself mean the write happened.
+    enum State: String, Codable {
+        case pending
+        case committed
+    }
+
+    /// Identity of the .bak Uncoded made, so a later fix can tell its own
+    /// pristine backup from a stale or foreign one.
+    struct BakRecord: Codable {
+        let size: Int
+        let modified: Date
+
+        /// Modification dates survive a JSON round-trip as floating point;
+        /// second granularity is all the identity check needs.
+        func matches(_ other: BakRecord) -> Bool {
+            size == other.size && abs(modified.timeIntervalSince(other.modified)) < 1
+        }
+    }
+
+    /// A slice of the file outside every patched region — image data, in
+    /// practice. The patched regions hold lens strings and a length, which two
+    /// frames shot with the same lens share; this is what makes the fingerprint
+    /// frame-unique. Absent in v0.1.x journals, which then match on the
+    /// patches alone.
+    struct ContentSample: Codable {
+        let offset: Int
+        let length: Int
+        let hash: String
+
+        /// FNV-1a: not a security hash, just a cheap wide one.
+        static func hash(_ bytes: Data) -> String {
+            var h: UInt64 = 0xCBF2_9CE4_8422_2325
+            for byte in bytes {
+                h ^= UInt64(byte)
+                h = h &* 0x0000_0100_0000_01B3
+            }
+            return String(h, radix: 16)
+        }
+    }
+
+    /// v0.1.x journals were saved only after a successful write.
+    var isCommitted: Bool { (state ?? .committed) == .committed }
+
+    var fileName: String { originalFileName ?? URL(fileURLWithPath: filePath).lastPathComponent }
+
+    /// Length the file has once the write has landed.
+    var writtenLength: Int { originalLength + appendedBytes }
+
+    /// Where each patched region stands. A commit writes its patches one after
+    /// another, so a crash in the middle leaves some regions written and some
+    /// not — a state neither "as written" nor "as it was", and one only this
+    /// per-region verdict can tell apart from a file somebody else edited.
+    struct PatchAudit {
+        /// Every region holds its pre-write bytes.
+        var allOriginal: Bool
+        /// Every region holds its post-write bytes.
+        var allNew: Bool
+        /// Some region holds bytes from neither state — or the journal itself
+        /// doesn't add up. Either way: not ours to touch.
+        var anyForeign: Bool
+    }
+
+    func audit(_ data: Data) -> PatchAudit {
+        guard originalLength >= 0, appendedBytes >= 0, !patches.isEmpty, sampleMatches(data) else {
+            return PatchAudit(allOriginal: false, allNew: false, anyForeign: true)
+        }
+        var audit = PatchAudit(allOriginal: true, allNew: true, anyForeign: false)
+        for patch in patches {
+            // A patch whose two sides differ in length can't be reasoned about
+            // — and restoring it would move every byte after it.
+            guard patch.original.count == patch.new.count else {
+                return PatchAudit(allOriginal: false, allNew: false, anyForeign: true)
+            }
+            let isOriginal = holds(patch.original, at: patch.offset, in: data)
+            let isNew = holds(patch.new, at: patch.offset, in: data)
+            audit.allOriginal = audit.allOriginal && isOriginal
+            audit.allNew = audit.allNew && isNew
+            audit.anyForeign = audit.anyForeign || (!isOriginal && !isNew)
+        }
+        return audit
+    }
+
+    /// True when `data` is exactly what this write leaves behind.
+    func describesWrittenBytes(_ data: Data) -> Bool {
+        data.count == writtenLength && audit(data).allNew
+    }
+
+    /// True when `data` is still the pre-write file — the write never landed.
+    func describesOriginalBytes(_ data: Data) -> Bool {
+        data.count == originalLength && audit(data).allOriginal
+    }
+
+    /// The sample sits inside the original length and outside every patch, so
+    /// it reads the same before and after the write.
+    private func sampleMatches(_ data: Data) -> Bool {
+        guard let sample else { return true }
+        guard sample.offset >= 0, sample.length > 0, sample.offset <= data.count - sample.length
+        else { return false }
+        let slice = data.subdata(in: sample.offset..<(sample.offset + sample.length))
+        return ContentSample.hash(slice) == sample.hash
+    }
+
+    private func holds(_ bytes: Data, at offset: Int, in data: Data) -> Bool {
+        guard offset >= 0, !bytes.isEmpty, offset <= data.count - bytes.count else { return false }
+        return data.subdata(in: offset..<(offset + bytes.count)) == bytes
+    }
+
+    /// The same write, recorded against a file that has moved since.
+    func relocated(to url: URL) -> WriteJournal {
+        guard url.path != filePath else { return self }
+        return WriteJournal(filePath: url.path, date: date, originalLength: originalLength,
+                            patches: patches, appendedBytes: appendedBytes,
+                            originalFileName: fileName, state: state, bak: bak, sample: sample)
+    }
 }
 
 enum TIFFWriteError: Error, LocalizedError {
     case missingTag(String)
     case corruptStructure
     case fileChangedSinceFix
+    case nonTextTag(tag: UInt16, type: UInt16)
+    case undecodableXMP
+    case malformedXMP(String)
+    case xmpMissingDescription
+    case invalidValue(String)
+    case fileTooLarge
+    case fileChangedWhileWriting
 
     var errorDescription: String? {
         switch self {
@@ -39,6 +273,23 @@ enum TIFFWriteError: Error, LocalizedError {
         case .corruptStructure: return "File structure not understood; refusing to write"
         case .fileChangedSinceFix:
             return "This file changed since Uncoded fixed it — reverting would damage it. Restore the .bak copy instead."
+        case .nonTextTag(let tag, let type):
+            return String(format: """
+            Field 0x%04X holds TIFF type %d instead of the text type Uncoded \
+            expects. Rewriting those bytes could destroy whatever the camera \
+            put there, so this file is left untouched.
+            """, tag, type)
+        case .undecodableXMP:
+            return "This file's XMP block is not UTF-8 text. Rewriting it would throw away metadata Uncoded cannot read (develop settings, ratings, GPS), so the file is left untouched."
+        case .malformedXMP(let detail):
+            return "This file's XMP block is not well-formed XML (\(detail)). Uncoded will not guess at where the lens properties belong in it, so the file is left untouched."
+        case .xmpMissingDescription:
+            return "This file's XMP block has no rdf:Description element to hold the lens properties; refusing rather than reporting a fix that only half happened."
+        case .invalidValue(let detail): return detail
+        case .fileTooLarge:
+            return "File is too large for TIFF's 32-bit offsets; refusing to write"
+        case .fileChangedWhileWriting:
+            return "This file changed while Uncoded was preparing the fix; nothing was written. Try again."
         }
     }
 }
@@ -52,7 +303,15 @@ struct TIFFWriter {
     private let layout: TIFFReader.TIFFStructure
     private let originalLength: Int
 
-    private var patches: [(offset: Int, new: Data)] = []
+    /// Value bytes are written (and flushed) before the pointers and counts
+    /// that describe them, so an interrupted commit never leaves a field
+    /// pointing at bytes that aren't on disk.
+    private enum PatchKind {
+        case value
+        case pointer
+    }
+
+    private var patches: [(offset: Int, new: Data, kind: PatchKind)] = []
     private var appendix = Data()
 
     private enum Tag {
@@ -70,18 +329,38 @@ struct TIFFWriter {
         self.layout = try TIFFReader(data: data).structure()
     }
 
+    /// A planned write: nothing on disk has been touched, but the journal that
+    /// describes the change already exists. Splitting the two lets the caller
+    /// persist the undo record *before* the bytes move.
+    struct Prepared {
+        let journal: WriteJournal
+        fileprivate let writer: TIFFWriter
+        fileprivate let url: URL
+
+        /// The journal goes back into the commit as the record of what the plan
+        /// was made against — its patch bytes and content sample are copies taken
+        /// at planning time, so they still describe the file as it was then even
+        /// if the file itself has moved on.
+        func commit() throws { try writer.commit(to: url, verifying: journal) }
+    }
+
+    /// Plans the write and returns it with its journal, unapplied.
+    static func prepare(_ write: LensWrite, to url: URL) throws -> Prepared {
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
+        var writer = try TIFFWriter(data: data)
+        try writer.plan(write)
+        return Prepared(journal: writer.journal(for: url), writer: writer, url: url)
+    }
+
     /// Applies the write to the file on disk and returns the journal.
     /// With `dryRun` the file is untouched and the journal describes what
     /// would change.
     static func apply(_ write: LensWrite, to url: URL, dryRun: Bool = false) throws -> WriteJournal {
-        let data = try Data(contentsOf: url, options: .alwaysMapped)
-        var writer = try TIFFWriter(data: data)
-        try writer.plan(write)
-        let journal = writer.journal(for: url)
+        let prepared = try prepare(write, to: url)
         if !dryRun {
-            try writer.commit(to: url)
+            try prepared.commit()
         }
-        return journal
+        return prepared.journal
     }
 
     /// Restores a file to its pre-write state using the journal — but only
@@ -91,13 +370,18 @@ struct TIFFWriter {
     /// it, so we refuse instead.
     static func revert(_ journal: WriteJournal) throws {
         let url = URL(fileURLWithPath: journal.filePath)
-        let data = try Data(contentsOf: url, options: .alwaysMapped)
-        guard data.count == journal.originalLength + journal.appendedBytes else {
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
+        // A journal is a file on disk like any other: treat its numbers as
+        // untrusted too, or a hand-edited (or truncated) one traps here.
+        guard journal.originalLength >= 0, journal.appendedBytes >= 0,
+              journal.originalLength == data.count - journal.appendedBytes else {
             throw TIFFWriteError.fileChangedSinceFix
         }
         for patch in journal.patches {
-            let end = patch.offset + patch.new.count
-            guard end <= data.count, data.subdata(in: patch.offset..<end) == patch.new else {
+            guard patch.offset >= 0, patch.original.count == patch.new.count,
+                  patch.offset <= data.count - patch.new.count,
+                  data.subdata(in: patch.offset..<(patch.offset + patch.new.count)) == patch.new
+            else {
                 throw TIFFWriteError.fileChangedSinceFix
             }
         }
@@ -121,17 +405,21 @@ struct TIFFWriter {
         try setString(Tag.lensModel, write.lensModel, in: layout.exif, additions: &exifAdditions)
 
         if let focal = write.focalMM {
-            try setRationals(Tag.focalLength, [focal], in: layout.exif, additions: &exifAdditions)
-            if let aperture = write.apertureF {
-                try setRationals(Tag.lensSpec, [focal, focal, aperture, aperture],
-                                 in: layout.exif, additions: &exifAdditions)
-            }
+            try setRationals(Tag.focalLength, [focal], field: "Focal length",
+                             in: layout.exif, additions: &exifAdditions)
+        }
+        // Its own statement rather than nested in the FocalLength write, though
+        // LensSpecification does need the focal rationals: with no focal length
+        // neither of the two EXIF fields is touched.
+        if let focal = write.focalMM, let aperture = write.apertureF {
+            try setRationals(Tag.lensSpec, [focal, focal, aperture, aperture],
+                             field: "Lens specification", in: layout.exif, additions: &exifAdditions)
         }
 
         var newExifOffset: UInt32?
         if !exifAdditions.isEmpty {
             guard let exifOffset = layout.exifIFDOffset else { throw TIFFWriteError.missingTag("Exif IFD") }
-            newExifOffset = UInt32(rebuildIFD(at: exifOffset, adding: exifAdditions))
+            newExifOffset = try u32Offset(rebuildIFD(at: exifOffset, adding: exifAdditions))
         }
 
         try setXMP(write, newExifOffset: newExifOffset)
@@ -140,7 +428,7 @@ struct TIFFWriter {
         // wasn't rebuilt — setXMP handles the pointer when it rebuilds IFD0).
         if let newExifOffset, !rebuiltIFD0 {
             guard let pointer = layout.ifd0[Tag.exifIFD] else { throw TIFFWriteError.corruptStructure }
-            patch(at: pointer.fieldOffset, u32Bytes(newExifOffset))
+            try patch(at: pointer.fieldOffset, u32Bytes(newExifOffset), kind: .pointer)
         }
     }
 
@@ -156,101 +444,119 @@ struct TIFFWriter {
 
         guard let entry = ifd[tag] else {
             additions.append(NewEntry(tag: tag, type: 2, count: bytes.count,
-                                      valueField: valueField(for: bytes)))
+                                      valueField: try valueField(for: bytes)))
             return
         }
+        guard entry.type == 2 else { throw TIFFWriteError.nonTextTag(tag: tag, type: entry.type) }
 
-        let oldSize = entry.count * (entry.type == 2 ? 1 : 1)
+        let oldSize = (TIFFReader.typeSizes[entry.type] ?? 1) * entry.count
         if oldSize <= 4 {
             if bytes.count <= 4 {
-                patch(at: entry.fieldOffset - 4, u32Bytes(UInt32(bytes.count)))
-                patch(at: entry.fieldOffset, bytes.padded(to: 4))
+                try setCountAndField(entry, count: bytes.count, field: bytes.padded(to: 4))
             } else {
-                let offset = append(bytes)
-                patch(at: entry.fieldOffset - 4, u32Bytes(UInt32(bytes.count)))
-                patch(at: entry.fieldOffset, u32Bytes(UInt32(offset)))
+                let offset = try u32Offset(append(bytes))
+                try setCountAndField(entry, count: bytes.count, field: u32Bytes(offset))
             }
         } else {
             guard let valueOffset = TIFFReader.u32(data, at: entry.fieldOffset, littleEndian: layout.littleEndian) else {
                 throw TIFFWriteError.corruptStructure
             }
             if bytes.count <= oldSize {
-                patch(at: entry.fieldOffset - 4, u32Bytes(UInt32(bytes.count)))
-                patch(at: Int(valueOffset), bytes)
+                try patch(at: Int(valueOffset), bytes, kind: .value)
+                try patch(at: entry.fieldOffset - 4, u32Bytes(UInt32(bytes.count)), kind: .pointer)
             } else {
-                let offset = append(bytes)
-                patch(at: entry.fieldOffset - 4, u32Bytes(UInt32(bytes.count)))
-                patch(at: entry.fieldOffset, u32Bytes(UInt32(offset)))
+                let offset = try u32Offset(append(bytes))
+                try setCountAndField(entry, count: bytes.count, field: u32Bytes(offset))
             }
         }
     }
 
+    /// Updates an entry's count and value/offset fields as one 8-byte write.
+    /// They are contiguous, and they only make sense together: a count that
+    /// landed against the old offset describes bytes that aren't there.
+    private mutating func setCountAndField(_ entry: TIFFReader.TIFFEntry,
+                                           count: Int, field: Data) throws {
+        try patch(at: entry.fieldOffset - 4, u32Bytes(UInt32(count)) + field, kind: .pointer)
+    }
+
     /// Sets a RATIONAL tag (same count in place — rationals never change size).
-    private mutating func setRationals(_ tag: UInt16, _ values: [Double],
+    private mutating func setRationals(_ tag: UInt16, _ values: [Double], field: String,
                                        in ifd: [UInt16: TIFFReader.TIFFEntry],
                                        additions: inout [NewEntry]) throws {
         var bytes = Data()
         for v in values {
+            // A nonsensical number must be reported, not truncated into a
+            // trapping UInt32 conversion.
+            guard v.isFinite, v > 0, v <= 1_000_000 else {
+                throw TIFFWriteError.invalidValue("\(field) \(v) is out of range")
+            }
             bytes.append(u32Bytes(UInt32((v * 1000).rounded())))
             bytes.append(u32Bytes(1000))
         }
 
         guard let entry = ifd[tag] else {
             additions.append(NewEntry(tag: tag, type: 5, count: values.count,
-                                      valueField: valueField(for: bytes)))
+                                      valueField: try valueField(for: bytes)))
             return
         }
         guard entry.type == 5, entry.count == values.count,
               let valueOffset = TIFFReader.u32(data, at: entry.fieldOffset, littleEndian: layout.littleEndian)
         else { throw TIFFWriteError.corruptStructure }
-        patch(at: Int(valueOffset), bytes)
+        try patch(at: Int(valueOffset), bytes, kind: .value)
     }
 
     /// Rewrites the XMP packet with the lens properties. Fits → in-place with
     /// whitespace padding; grew → EOF append + entry re-point; missing → new
     /// packet + IFD0 rebuild.
     private mutating func setXMP(_ write: LensWrite, newExifOffset: UInt32?) throws {
-        let properties: [(String, String)] = [
-            ("aux:Lens", write.lensModel),
-            ("crs:LensProfileSetup", "Custom"),
-            ("crs:LensProfileName", write.profileName),
-            ("crs:LensProfileFilename", write.profileFilename),
-            ("crs:LensProfileDigest", write.profileDigest),
-            ("crs:LensProfileIsEmbedded", "False"),
-        ]
+        let properties = Self.xmpProperties(for: write)
 
         if let entry = layout.ifd0[Tag.xmp] {
+            // entry.count is only a byte count for the one-byte-per-component
+            // types; anything else and we don't know what we're looking at.
+            guard [1, 2, 7].contains(entry.type) else {
+                throw TIFFWriteError.nonTextTag(tag: Tag.xmp, type: entry.type)
+            }
             guard let valueOffset = TIFFReader.u32(data, at: entry.fieldOffset, littleEndian: layout.littleEndian),
                   entry.count > 4
             else { throw TIFFWriteError.corruptStructure }
-            let oldBytes = data.subdata(in: Int(valueOffset)..<(Int(valueOffset) + entry.count))
-            let oldXMP = String(data: oldBytes, encoding: .utf8) ?? Self.emptyPacket
-            var newBytes = Data(Self.transformXMP(oldXMP, properties: properties).utf8)
-            // The old packet's whitespace padding rides along in the transform;
-            // strip it so the size check sees the real content, then re-pad.
-            while let last = newBytes.last, last == 0x20 || last == 0x0A || last == 0x0D || last == 0x09 {
-                newBytes.removeLast()
+            let oldBytes = try slice(Int(valueOffset), entry.count)
+            // A packet we can't decode is a packet we can't safely rewrite:
+            // substituting an empty one would silently drop develop settings,
+            // ratings and GPS. (A UTF-8 BOM decodes fine and round-trips.)
+            guard let oldXMP = String(data: oldBytes, encoding: .utf8) else {
+                throw TIFFWriteError.undecodableXMP
             }
+            // transformXMP drops the old packet's padding, so this is the real
+            // content size; the padding to fill the slot goes back on after.
+            let newPacket = try Self.transformXMP(oldXMP, properties: properties)
+            let newBytes = Data(newPacket.utf8)
 
             if newBytes.count <= entry.count {
-                newBytes.append(Data(repeating: 0x20, count: entry.count - newBytes.count))
-                patch(at: Int(valueOffset), newBytes)
+                try patch(at: Int(valueOffset),
+                          Self.padded(newPacket, toByteCount: entry.count), kind: .value)
             } else {
-                let offset = append(newBytes)
-                patch(at: entry.fieldOffset - 4, u32Bytes(UInt32(newBytes.count)))
-                patch(at: entry.fieldOffset, u32Bytes(UInt32(offset)))
+                // A packet that has to move gets padding on the way out, so the
+                // next fix can rewrite it where it lands. The M11 pads nothing
+                // (2143 bytes of camera XMP against the ~2.3 KB a fix needs), so
+                // without this every re-fix abandons another dead copy at EOF.
+                let grown = Self.padded(newPacket, toByteCount: newBytes.count + Self.slackForRewrites)
+                let offset = try u32Offset(append(grown))
+                try setCountAndField(entry, count: grown.count, field: u32Bytes(offset))
             }
         } else {
             // No XMP at all: create a packet and rebuild IFD0 to reference it.
-            let packet = Data(Self.transformXMP(Self.emptyPacket, properties: properties).utf8)
+            // Padded for the same reason a moved packet is.
+            let text = try Self.transformXMP(Self.emptyPacket, properties: properties)
+            let packet = Self.padded(text, toByteCount: text.utf8.count + Self.slackForRewrites)
             var additions = [NewEntry(tag: Tag.xmp, type: 1, count: packet.count,
-                                      valueField: valueField(for: packet))]
+                                      valueField: try valueField(for: packet))]
             if let newExifOffset {
                 additions.append(NewEntry(tag: Tag.exifIFD, type: 4, count: 1,
                                           valueField: u32Bytes(newExifOffset)))
             }
-            let newIFD0 = rebuildIFD(at: layout.ifd0Offset, adding: additions)
-            patch(at: 4, u32Bytes(UInt32(newIFD0)))
+            let newIFD0 = try u32Offset(rebuildIFD(at: layout.ifd0Offset, adding: additions))
+            try patch(at: 4, u32Bytes(newIFD0), kind: .pointer)
             rebuiltIFD0 = true
         }
     }
@@ -266,15 +572,18 @@ struct TIFFWriter {
 
     /// Copies an IFD to the appendix with entries added/replaced (kept sorted
     /// by tag, as TIFF requires) and returns the new IFD's offset.
-    private mutating func rebuildIFD(at offset: Int, adding: [NewEntry]) -> Int {
+    private mutating func rebuildIFD(at offset: Int, adding: [NewEntry]) throws -> Int {
         let le = layout.littleEndian
-        let count = Int(TIFFReader.u16(data, at: offset, littleEndian: le) ?? 0)
+        guard let countRaw = TIFFReader.u16(data, at: offset, littleEndian: le) else {
+            throw TIFFWriteError.corruptStructure
+        }
+        let count = Int(countRaw)
 
         var entries: [(tag: UInt16, bytes: Data)] = []
         for i in 0..<count {
             let base = offset + 2 + i * 12
             guard let tag = TIFFReader.u16(data, at: base, littleEndian: le) else { continue }
-            var bytes = data.subdata(in: base..<(base + 12))
+            var bytes = try slice(base, 12)
             // Absorb pending in-place patches that target this entry — the
             // entry is moving into the rebuilt IFD, so patching the old
             // location would strand them.
@@ -293,9 +602,12 @@ struct TIFFWriter {
             entries.removeAll { $0.tag == new.tag }
             entries.append((new.tag, bytes))
         }
+        // An IFD's entry count is a UInt16: an IFD already near the limit plus
+        // our additions can't be expressed, so refuse instead of trapping.
+        guard entries.count <= Int(UInt16.max) else { throw TIFFWriteError.corruptStructure }
         entries.sort { $0.tag < $1.tag }
 
-        let nextPointer = data.subdata(in: (offset + 2 + count * 12)..<(offset + 2 + count * 12 + 4))
+        let nextPointer = try slice(offset + 2 + count * 12, 4)
 
         var ifd = u16Bytes(UInt16(entries.count))
         for entry in entries { ifd.append(entry.bytes) }
@@ -318,60 +630,303 @@ struct TIFFWriter {
         "crs": "http://ns.adobe.com/camera-raw-settings/1.0/",
     ]
 
-    /// Sets each property in the XMP text, replacing existing attribute or
-    /// element forms, or inserting attributes on the first rdf:Description
-    /// (declaring the namespace there when the document lacks it).
-    static func transformXMP(_ xmp: String, properties: [(String, String)]) -> String {
-        var result = xmp
+    /// The XMP properties one lens implies, in the order they are applied.
+    ///
+    /// A lens with no Adobe profile gets no `crs:LensProfile*` at all, and an
+    /// empty value is never written: `LensProfileSetup="Custom"` beside an empty
+    /// Digest/Filename/Name is a profile reference that names nothing, which is
+    /// the leading explanation for fixes that changed the metadata and yet did
+    /// nothing visible in Lightroom.
+    static func xmpProperties(for write: LensWrite) -> [(String, String)] {
+        var properties: [(String, String)] = [("aux:Lens", write.lensModel)]
+        if let info = write.xmpLensInfo {
+            properties.append(("aux:LensInfo", info))
+        }
+        guard write.hasProfile else { return properties }
+        properties.append(("crs:LensProfileSetup", "Custom"))
+        properties.append(("crs:LensProfileIsEmbedded", "False"))
+        for (name, value) in [("crs:LensProfileName", write.profileName),
+                              ("crs:LensProfileFilename", write.profileFilename),
+                              ("crs:LensProfileDigest", write.profileDigest)]
+        where !value.isEmpty {
+            properties.append((name, value))
+        }
+        return properties
+    }
+
+    /// Sets each property in an XMP packet, replacing whichever form (attribute
+    /// or element) the packet already uses and inserting an attribute otherwise.
+    ///
+    /// The XML in the packet is parsed, not pattern-matched: only a parser can
+    /// tell `crs:LensProfileName` *of* an rdf:Description from the same text
+    /// inside an `xmpMM:History` entry or a second Description, and only a
+    /// parser knows that a `>` inside an attribute value doesn't end the tag.
+    /// The `<?xpacket?>` processing instructions are peeled off and put back
+    /// verbatim instead: the header carries a BOM, real M11 packets have a NUL
+    /// byte after the trailer, and neither belongs to the document.
+    static func transformXMP(_ xmp: String, properties: [(String, String)]) throws -> String {
+        // A sentinel already in the packet would come back out as a character
+        // reference, silently changing a value we were asked to preserve. It is
+        // a private-use codepoint — legal XML, so it can only be refused.
+        guard !whitespaceEscapes.contains(where: { escape in
+            xmp.contains(escape.sentinel) || properties.contains { $0.1.contains(escape.sentinel) }
+        }) else {
+            throw TIFFWriteError.malformedXMP(
+                "it uses a private-use character (U+E000–U+E002) that Uncoded needs while rewriting")
+        }
+
+        let packet = Packet(xmp)
+        let document: XMLDocument
+        do {
+            // External entities are never resolved: this is XML out of a file we
+            // did not write, and an XMP packet has no business fetching a DTD.
+            document = try XMLDocument(xmlString: packet.body,
+                                       options: [.nodePreserveWhitespace, .nodePreserveCDATA,
+                                                 .nodeLoadExternalEntitiesNever])
+        } catch {
+            // NSXML reports one line per problem and ends with a newline; that
+            // reads badly inside a sentence in a dialog.
+            let detail = error.localizedDescription
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: "\n", with: "; ")
+            throw TIFFWriteError.malformedXMP(detail)
+        }
+
+        let descriptions = allDescriptions(in: document)
+        // Prefer the Description that already carries the lens vocabulary — the
+        // camera and Lightroom keep aux:/crs: together — else the first one.
+        // None at all means there is nowhere to write, and reporting success
+        // would mean an EXIF-only fix with the XMP untouched.
+        guard let primary = descriptions.first(where: carriesLensVocabulary) ?? descriptions.first
+        else { throw TIFFWriteError.xmpMissingDescription }
+
+        // XMP spreads one subject's properties over as many rdf:Descriptions as
+        // it likes, all naming that subject in rdf:about. A Description about a
+        // *different* subject describes a different resource, and this file's
+        // lens is none of its business — so it is not a candidate.
+        let subject = about(primary)
+        let candidates = descriptions.filter { about($0) == subject }
+
         for (name, value) in properties {
-            let escapedName = NSRegularExpression.escapedPattern(for: name)
-            let escapedValue = xmlEscape(value)
+            // A property already present somewhere is updated *there*: adding a
+            // second copy on `primary` would make the packet contradict itself.
+            let target = candidates.first { holds(name, $0) } ?? primary
+            set(name, to: value, on: target)
+        }
 
-            let attrPattern = escapedName + #"\s*=\s*"[^"]*""#
-            if let regex = try? NSRegularExpression(pattern: attrPattern),
-               regex.firstMatch(in: result, range: NSRange(result.startIndex..., in: result)) != nil {
-                result = regex.stringByReplacingMatches(
-                    in: result, range: NSRange(result.startIndex..., in: result),
-                    withTemplate: NSRegularExpression.escapedTemplate(for: "\(name)=\"\(escapedValue)\""))
-                continue
-            }
+        protectWhitespace(in: document)
+        let body = (document.children ?? [])
+            .map { $0.xmlString(options: [.nodePreserveWhitespace]) }
+            .joined()
+        return packet.reassembled(body: restoreWhitespace(in: body))
+    }
 
-            let elemPattern = "(<" + escapedName + #"(?:\s[^>]*)?>)[^<]*(</"# + escapedName + ">)"
-            if let regex = try? NSRegularExpression(pattern: elemPattern),
-               regex.firstMatch(in: result, range: NSRange(result.startIndex..., in: result)) != nil {
-                result = regex.stringByReplacingMatches(
-                    in: result, range: NSRange(result.startIndex..., in: result),
-                    withTemplate: "$1" + NSRegularExpression.escapedTemplate(for: escapedValue) + "$2")
-                continue
-            }
+    private static func about(_ element: XMLElement) -> String {
+        element.attribute(forName: "rdf:about")?.stringValue ?? ""
+    }
 
-            // Insert as attribute on the first rdf:Description. The namespace
-            // must be declared in scope of THAT element (ancestors or the
-            // element itself) — a declaration on a later sibling doesn't count.
-            guard let tagStart = result.range(of: "<rdf:Description") else { continue }
-            let tagEnd = result[tagStart.upperBound...].firstIndex(of: ">") ?? result.endIndex
-            let scope = result[..<tagEnd]
-            var insertion = " \(name)=\"\(escapedValue)\""
-            let prefix = String(name.prefix(while: { $0 != ":" }))
-            if let uri = namespaces[prefix], !scope.contains("xmlns:\(prefix)") {
-                insertion = " xmlns:\(prefix)=\"\(uri)\"" + insertion
+    /// Characters NSXML will not escape but XML will not carry literally.
+    ///
+    /// Serializing an attribute value writes a LF, CR or TAB out as itself, and
+    /// the next parser to read the packet collapses each of those to a space
+    /// under attribute-value normalization — the value is gone, with no way
+    /// back. A literal CR in element text is the same story: XML line-ending
+    /// normalization turns it into LF. The XMP spec (and Adobe's own writer)
+    /// use the character references, which normalization leaves alone.
+    ///
+    /// NSXML offers no hook into how it escapes, so the characters are swapped
+    /// for private-use sentinels before serializing and the sentinels become
+    /// character references in the serialized text afterwards.
+    private static let whitespaceEscapes:
+        [(character: Character, sentinel: Character, reference: String)] = [
+            ("\n", "\u{E000}", "&#xA;"),
+            ("\r", "\u{E001}", "&#xD;"),
+            ("\t", "\u{E002}", "&#x9;"),
+        ]
+
+    private static func protectWhitespace(in node: XMLNode) {
+        for attribute in (node as? XMLElement)?.attributes ?? [] {
+            guard let value = attribute.stringValue else { continue }
+            var escaped = value
+            for escape in whitespaceEscapes {
+                escaped = escaped.replacingOccurrences(of: String(escape.character),
+                                                       with: String(escape.sentinel))
             }
-            result.insert(contentsOf: insertion, at: tagStart.upperBound)
+            if escaped != value { attribute.stringValue = escaped }
+        }
+        // Only CR: a LF or TAB in element text survives a round trip as itself.
+        if node.kind == .text, let value = node.stringValue,
+           let cr = whitespaceEscapes.first(where: { $0.character == "\r" }), value.contains(cr.character) {
+            node.stringValue = value.replacingOccurrences(of: String(cr.character),
+                                                          with: String(cr.sentinel))
+        }
+        for child in node.children ?? [] { protectWhitespace(in: child) }
+    }
+
+    private static func restoreWhitespace(in serialized: String) -> String {
+        var result = serialized
+        for escape in whitespaceEscapes {
+            result = result.replacingOccurrences(of: String(escape.sentinel), with: escape.reference)
         }
         return result
     }
 
-    private static func xmlEscape(_ s: String) -> String {
-        s.replacingOccurrences(of: "&", with: "&amp;")
-            .replacingOccurrences(of: "<", with: "&lt;")
-            .replacingOccurrences(of: ">", with: "&gt;")
-            .replacingOccurrences(of: "\"", with: "&quot;")
+    /// Every rdf:Description in the document, in document order.
+    private static func allDescriptions(in node: XMLNode) -> [XMLElement] {
+        var found: [XMLElement] = []
+        if let element = node as? XMLElement, element.name == "rdf:Description" {
+            found.append(element)
+        }
+        for child in node.children ?? [] {
+            found.append(contentsOf: allDescriptions(in: child))
+        }
+        return found
+    }
+
+    private static func carriesLensVocabulary(_ element: XMLElement) -> Bool {
+        let names = (element.attributes ?? []).compactMap(\.name)
+            + (element.children ?? []).compactMap { ($0 as? XMLElement)?.name }
+        return names.contains { $0.hasPrefix("aux:") || $0.hasPrefix("crs:") }
+    }
+
+    private static func holds(_ name: String, _ element: XMLElement) -> Bool {
+        element.attribute(forName: name) != nil || !childElements(name, of: element).isEmpty
+    }
+
+    private static func childElements(_ name: String, of element: XMLElement) -> [XMLElement] {
+        (element.children ?? []).compactMap { $0 as? XMLElement }.filter { $0.name == name }
+    }
+
+    /// Writes one property onto one Description, keeping whichever form the
+    /// packet already uses. A property held as both attribute and element is a
+    /// duplicate either way, so the element form is dropped.
+    private static func set(_ name: String, to value: String, on element: XMLElement) {
+        if let attribute = element.attribute(forName: name) {
+            attribute.stringValue = value
+            for stale in childElements(name, of: element) { stale.detach() }
+            return
+        }
+        if let existing = childElements(name, of: element).first {
+            existing.stringValue = value
+            return
+        }
+        declareNamespace(for: name, on: element)
+        if let attribute = XMLNode.attribute(withName: name, stringValue: value) as? XMLNode {
+            element.addAttribute(attribute)
+        }
+    }
+
+    /// A prefixed attribute needs its namespace declared in scope of the element
+    /// itself or an ancestor — a declaration on a sibling Description, which is
+    /// how Lightroom writes them, does not count.
+    private static func declareNamespace(for name: String, on element: XMLElement) {
+        let prefix = String(name.prefix(while: { $0 != ":" }))
+        guard let uri = namespaces[prefix] else { return }
+        var scope: XMLElement? = element
+        while let current = scope {
+            if (current.namespaces ?? []).contains(where: { $0.name == prefix }) { return }
+            scope = current.parent as? XMLElement
+        }
+        if let declaration = XMLNode.namespace(withName: prefix, stringValue: uri) as? XMLNode {
+            element.addNamespace(declaration)
+        }
+    }
+
+    /// Whitespace padding given to a packet Uncoded writes somewhere new, so the
+    /// next rewrite fits inside it instead of abandoning this one at EOF.
+    static let slackForRewrites = 2048
+
+    /// Grows a packet to exactly `byteCount` bytes with whitespace padding,
+    /// placed where the XMP spec puts it: after the XML and *before* the
+    /// `<?xpacket end?>` trailer, so a reader that stops at the trailer has
+    /// already seen the whole document. (v0.1.x appended it after the trailer.)
+    static func padded(_ packet: String, toByteCount byteCount: Int) -> Data {
+        let bytes = Data(packet.utf8)
+        guard byteCount > bytes.count else { return bytes }
+        // One byte per space in UTF-8, so the resulting length is exact.
+        let spaces = String(repeating: " ", count: byteCount - bytes.count)
+        guard let trailer = packet.range(of: Packet.trailerMarker, options: .backwards) else {
+            return bytes + Data(spaces.utf8)
+        }
+        var padded = packet
+        padded.insert(contentsOf: spaces, at: trailer.lowerBound)
+        return Data(padded.utf8)
+    }
+
+    /// An XMP packet split into the parts an XML parser must not own: the
+    /// `<?xpacket begin?>` header, the XML body, and the `<?xpacket end?>`
+    /// trailer plus whatever the camera left after it (the M11 writes a NUL).
+    struct Packet {
+        static let trailerMarker = "<?xpacket end"
+
+        let head: String
+        let body: String
+        let tail: String
+
+        init(_ xmp: String) {
+            // Trailing whitespace is padding that v0.1.x put on the wrong side
+            // of the trailer; drop it and let the writer re-pad properly.
+            var text = xmp
+            while let last = text.last, last.isWhitespace { text.removeLast() }
+
+            var rest = Substring(text)
+            var head = ""
+            if let begin = rest.range(of: "<?xpacket"),
+               rest[..<begin.lowerBound].allSatisfy({ $0.isWhitespace || $0 == "\u{FEFF}" }),
+               let close = rest.range(of: "?>", range: begin.upperBound..<rest.endIndex) {
+                head = String(rest[..<close.upperBound])
+                rest = rest[close.upperBound...]
+            }
+            var tail = ""
+            if let end = rest.range(of: Self.trailerMarker, options: .backwards) {
+                tail = String(rest[end.lowerBound...])
+                rest = rest[..<end.lowerBound]
+            }
+            self.head = head
+            self.tail = tail
+            self.body = String(rest)
+        }
+
+        func reassembled(body: String) -> String {
+            var out = head.isEmpty ? "" : head + "\n"
+            out += body
+            if !tail.isEmpty { out += "\n" + tail }
+            return out
+        }
     }
 
     // MARK: - Patch/append plumbing
 
-    private mutating func patch(at offset: Int, _ bytes: Data) {
-        patches.append((offset, bytes))
+    /// The single gate every in-place write passes through. Offsets come out
+    /// of the file itself, so a corrupt DNG can aim one anywhere: a write past
+    /// EOF would punch a sparse hole (and its length change would permanently
+    /// defeat revert's guard), one inside the image data would corrupt pixels.
+    /// Overlapping patches are refused too — the journal couldn't undo them.
+    private mutating func patch(at offset: Int, _ bytes: Data, kind: PatchKind) throws {
+        guard !bytes.isEmpty, offset >= 0, offset <= originalLength - bytes.count else {
+            throw TIFFWriteError.corruptStructure
+        }
+        let end = offset + bytes.count
+        guard !patches.contains(where: { offset < $0.offset + $0.new.count && $0.offset < end }) else {
+            throw TIFFWriteError.corruptStructure
+        }
+        patches.append((offset, bytes, kind))
+    }
+
+    /// Bounds-checked read of the original bytes: the writer must never take a
+    /// range from a file-supplied offset on trust.
+    private func slice(_ start: Int, _ count: Int) throws -> Data {
+        guard start >= 0, count >= 0, start <= originalLength - count else {
+            throw TIFFWriteError.corruptStructure
+        }
+        return data.subdata(in: start..<(start + count))
+    }
+
+    /// TIFF offsets are 32-bit; a value that lands beyond 4 GB can't be
+    /// pointed at, so refuse instead of trapping on the conversion.
+    private func u32Offset(_ offset: Int) throws -> UInt32 {
+        guard offset >= 0, offset <= Int(UInt32.max) else { throw TIFFWriteError.fileTooLarge }
+        return UInt32(offset)
     }
 
     /// Adds bytes to the end-of-file appendix (word-aligned, as TIFF values
@@ -385,9 +940,9 @@ struct TIFFWriter {
 
     /// A 4-byte IFD value field: inline when the value fits, otherwise an
     /// offset to the value appended at end-of-file.
-    private mutating func valueField(for bytes: Data) -> Data {
+    private mutating func valueField(for bytes: Data) throws -> Data {
         if bytes.count <= 4 { return bytes.padded(to: 4) }
-        return u32Bytes(UInt32(append(bytes)))
+        return u32Bytes(try u32Offset(append(bytes)))
     }
 
     private func u16Bytes(_ v: UInt16) -> Data {
@@ -403,31 +958,114 @@ struct TIFFWriter {
 
     // MARK: - Journal & commit
 
+    /// Patches in the order `commit` writes them, so the journal describes the
+    /// file exactly as it will be left.
+    private var orderedPatches: [(offset: Int, new: Data, kind: PatchKind)] {
+        patches.filter { $0.kind == .value } + patches.filter { $0.kind == .pointer }
+    }
+
     private func journal(for url: URL) -> WriteJournal {
-        let recorded = patches.map { patch -> WritePatch in
-            let end = min(patch.offset + patch.new.count, originalLength)
-            let original = patch.offset < originalLength
-                ? data.subdata(in: patch.offset..<end)
-                : Data()
-            return WritePatch(offset: patch.offset, original: original, new: patch.new)
+        // patch(at:) guarantees every range lies inside the original file.
+        let recorded = orderedPatches.map { patch in
+            WritePatch(offset: patch.offset,
+                       original: data.subdata(in: patch.offset..<(patch.offset + patch.new.count)),
+                       new: patch.new)
         }
         return WriteJournal(filePath: url.path, date: Date(),
                             originalLength: originalLength,
-                            patches: recorded, appendedBytes: appendix.count)
+                            patches: recorded, appendedBytes: appendix.count,
+                            originalFileName: url.lastPathComponent,
+                            state: .pending, sample: contentSample(besides: recorded))
     }
 
-    private func commit(to url: URL) throws {
-        let handle = try FileHandle(forWritingTo: url)
+    /// Picks a window of untouched bytes near end-of-file — image data, on a
+    /// real frame — to give the journal something no other frame shares.
+    private func contentSample(besides recorded: [WritePatch]) -> WriteJournal.ContentSample? {
+        let length = min(4096, originalLength / 4)
+        guard length > 0 else { return nil }
+        var offset = originalLength - length
+        while offset >= 0 {
+            let end = offset + length
+            let clear = !recorded.contains { $0.offset < end && offset < $0.offset + $0.new.count }
+            if clear {
+                let slice = data.subdata(in: offset..<end)
+                return WriteJournal.ContentSample(offset: offset, length: length,
+                                                  hash: WriteJournal.ContentSample.hash(slice))
+            }
+            offset -= length
+        }
+        return nil
+    }
+
+    /// Proves the file still holds the bytes the plan was made against, at the
+    /// last possible moment before the first write.
+    ///
+    /// Matching lengths are not enough. Planning happens well before the write:
+    /// in between, Uncoded copies the file to `.bak` and saves an undo record,
+    /// and that window is wide enough for Lightroom to write its own metadata
+    /// back — an in-place edit, or an atomic replace, either of which can leave
+    /// the length untouched. Patching planned offsets into bytes that have moved
+    /// would corrupt them, and the journal would afterwards "revert" the file to
+    /// bytes that were never there, throwing away the other writer's work.
+    ///
+    /// Only the regions this write will overwrite, plus the journal's sample of
+    /// untouched content, are re-read — a few KB of what may be a 100 MB raw.
+    /// The mapped copy `data` is no use for this: an in-place edit shows through
+    /// a mapping, so the "original" bytes it holds may already be the new ones.
+    private func verifyPlannedBytes(_ journal: WriteJournal, using handle: FileHandle) throws {
+        func bytes(at offset: Int, _ count: Int) throws -> Data? {
+            try handle.seek(toOffset: UInt64(offset))
+            return try handle.read(upToCount: count)
+        }
+        for patch in journal.patches {
+            guard try bytes(at: patch.offset, patch.original.count) == patch.original else {
+                throw TIFFWriteError.fileChangedWhileWriting
+            }
+        }
+        // The sample is what catches an edit that missed every patched region —
+        // develop settings, a rating, GPS.
+        if let sample = journal.sample {
+            guard let slice = try bytes(at: sample.offset, sample.length),
+                  slice.count == sample.length,
+                  WriteJournal.ContentSample.hash(slice) == sample.hash
+            else { throw TIFFWriteError.fileChangedWhileWriting }
+        }
+    }
+
+    /// Write ordering is the whole safety story here: a crash or a full disk
+    /// between two writes must never leave a pointer or count describing bytes
+    /// that aren't on disk. So the appendix lands and is flushed first, then
+    /// value bytes, then — last, after another flush — the pointers and counts
+    /// that describe them. A half-finished commit is then still a readable file
+    /// whose fields all point at real bytes.
+    private func commit(to url: URL, verifying journal: WriteJournal) throws {
+        // Opened for updating, not writing: the verification below has to read
+        // through the same descriptor it is about to write through.
+        let handle = try FileHandle(forUpdating: url)
         defer { try? handle.close() }
+        // Every appendix offset was computed against the length we mapped, and
+        // the appendix is written at the current end of file: if anything grew
+        // the file since planning, all of those offsets are wrong.
+        guard try handle.seekToEnd() == UInt64(originalLength) else {
+            throw TIFFWriteError.fileChangedWhileWriting
+        }
+        try verifyPlannedBytes(journal, using: handle)
         if !appendix.isEmpty {
-            try handle.seekToEnd()
+            // Seek explicitly: verifying read all over the file, so the cursor is
+            // wherever that left it, not at end-of-file.
+            try handle.seek(toOffset: UInt64(originalLength))
             try handle.write(contentsOf: appendix)
+            try handle.synchronize()
         }
-        for patch in patches {
-            try handle.seek(toOffset: UInt64(patch.offset))
-            try handle.write(contentsOf: patch.new)
+        for kind in [PatchKind.value, .pointer] {
+            let group = patches.filter { $0.kind == kind }
+            guard !group.isEmpty else { continue }
+            for patch in group {
+                try handle.seek(toOffset: UInt64(patch.offset))
+                try handle.write(contentsOf: patch.new)
+            }
+            try handle.synchronize()
         }
-        try handle.synchronize()
     }
 }
 

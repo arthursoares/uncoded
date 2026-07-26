@@ -24,6 +24,7 @@ struct TIFFReader {
         var lensModel: String?
         var lensSpec: String? // rendered from EXIF LensSpecification, e.g. "50mm f/1.2"
         var auxLens: String? // XMP aux:Lens
+        var auxLensInfo: String? // XMP aux:LensInfo, e.g. "35/1 35/1 2/1 2/1"
         var profileName: String? // XMP crs:LensProfileName
         var profileFilename: String? // XMP crs:LensProfileFilename
         var profileDigest: String? // XMP crs:LensProfileDigest
@@ -66,8 +67,10 @@ struct TIFFReader {
     }
 
     /// Opens a DNG memory-mapped and extracts its lens metadata.
+    /// `.mappedIfSafe` and not `.alwaysMapped`: a file on a card that gets
+    /// pulled mid-scan would SIGBUS us on the next page fault.
     static func read(url: URL) throws -> LensMetadata {
-        let data = try Data(contentsOf: url, options: .alwaysMapped)
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
         return try TIFFReader(data: data).lensMetadata()
     }
 
@@ -81,6 +84,9 @@ struct TIFFReader {
         if let xmpEntry = ifd0[Tag.xmp], let xmpData = valueData(xmpEntry),
            let xmp = String(data: xmpData, encoding: .utf8) {
             meta.auxLens = Self.xmpValue(xmp, property: "aux:Lens")
+            // The copy Lightroom shows. The camera's own describes the borrowed
+            // Leica lens, usually at the wrong maximum aperture.
+            meta.auxLensInfo = Self.xmpValue(xmp, property: "aux:LensInfo")
             meta.profileName = Self.xmpValue(xmp, property: "crs:LensProfileName")
             meta.profileFilename = Self.xmpValue(xmp, property: "crs:LensProfileFilename")
             meta.profileDigest = Self.xmpValue(xmp, property: "crs:LensProfileDigest")
@@ -103,7 +109,9 @@ struct TIFFReader {
             throw ReadError.truncated
         }
         let count = Int(countRaw)
-        guard offset + 2 + count * 12 <= data.count else { throw ReadError.truncated }
+        // The 4-byte next-IFD pointer is part of the IFD: validate it here so
+        // consumers (TIFFWriter's rebuild) can read the whole extent safely.
+        guard offset >= 0, offset + 2 + count * 12 + 4 <= data.count else { throw ReadError.truncated }
 
         var entries: [UInt16: Entry] = [:]
         for i in 0..<count {
@@ -117,7 +125,8 @@ struct TIFFReader {
         return entries
     }
 
-    private static let typeSizes: [UInt16: Int] = [
+    /// TIFF type → bytes per component (also used by TIFFWriter).
+    static let typeSizes: [UInt16: Int] = [
         1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8,
     ]
 
@@ -160,11 +169,18 @@ struct TIFFReader {
             else { return nil }
             values.append(Double(num) / Double(den))
         }
-        let focal = values[0] == values[1] ? fmt(values[0]) : "\(fmt(values[0]))-\(fmt(values[1]))"
-        return "\(focal)mm f/\(fmt(values[2]))"
+        return Self.lensSpecText(minFocal: values[0], maxFocal: values[1], aperture: values[2])
     }
 
-    private func fmt(_ v: Double) -> String {
+    /// The rendering `LensMetadata.lensSpec` uses, exposed so a `LensWrite` can
+    /// say what this field would read as once the write lands — without a
+    /// second copy of the format to drift out of step with this one.
+    static func lensSpecText(minFocal: Double, maxFocal: Double, aperture: Double) -> String {
+        let focal = minFocal == maxFocal ? fmt(minFocal) : "\(fmt(minFocal))-\(fmt(maxFocal))"
+        return "\(focal)mm f/\(fmt(aperture))"
+    }
+
+    private static func fmt(_ v: Double) -> String {
         v == v.rounded() ? String(Int(v)) : String(v)
     }
 
@@ -225,6 +241,14 @@ struct TIFFReader {
 
     /// Extracts an XMP property in either attribute (crs:X="…") or element
     /// (<crs:X>…</crs:X>) form.
+    ///
+    /// The value is XML text, so it comes back unescaped: the writer serializes
+    /// through `XMLDocument`, which turns `&` into `&amp;`, and deliberately
+    /// emits `&#xA;`/`&#xD;`/`&#x9;` for whitespace that attribute-value
+    /// normalization would otherwise eat. Handing that text back raw made a
+    /// lens called "Cooke &amp; Sons" read differently from the one that was
+    /// written — enough for `LensWrite.differs` to flag the frame on every
+    /// scan, for ever, and for the tooltip to print the escapes.
     static func xmpValue(_ xmp: String, property: String) -> String? {
         let escaped = NSRegularExpression.escapedPattern(for: property)
         for pattern in [
@@ -235,10 +259,63 @@ struct TIFFReader {
             let range = NSRange(xmp.startIndex..., in: xmp)
             if let match = regex.firstMatch(in: xmp, range: range),
                let r = Range(match.range(at: 1), in: xmp) {
-                let value = String(xmp[r]).trimmingCharacters(in: .whitespacesAndNewlines)
+                let value = unescapedXML(String(xmp[r]))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
                 if !value.isEmpty { return value }
             }
         }
         return nil
+    }
+
+    /// XML text back to the characters it stands for: the five named entities
+    /// and numeric character references in both bases.
+    ///
+    /// One left-to-right pass, never a series of replacements — decoding
+    /// `&amp;` first and `&lt;` after would turn the escaped text `&amp;lt;`
+    /// into a `<` that was never there. Anything that isn't a reference we
+    /// recognise is left exactly as written: an XMP packet is a file on disk
+    /// like any other, and inventing a character for `&frac12;` would be worse
+    /// than printing it.
+    static func unescapedXML(_ text: String) -> String {
+        guard text.contains("&") else { return text }
+        var out = ""
+        out.reserveCapacity(text.count)
+        var index = text.startIndex
+        while let ampersand = text[index...].firstIndex(of: "&") {
+            out += text[index..<ampersand]
+            let body = text.index(after: ampersand)
+            // A reference is short; scanning to a semicolon a paragraph away
+            // would swallow the text between them ("Cooke & Sons; est. 1893").
+            let limit = text.index(body, offsetBy: 12, limitedBy: text.endIndex) ?? text.endIndex
+            if let semicolon = text[body..<limit].firstIndex(of: ";"),
+               let decoded = Self.decodedReference(text[body..<semicolon]) {
+                out += decoded
+                index = text.index(after: semicolon)
+            } else {
+                out.append("&")
+                index = body
+            }
+        }
+        out += text[index...]
+        return out
+    }
+
+    /// The text between `&` and `;`, decoded — or nil if it names nothing.
+    private static func decodedReference(_ body: Substring) -> String? {
+        switch body {
+        case "amp": return "&"
+        case "lt": return "<"
+        case "gt": return ">"
+        case "quot": return "\""
+        case "apos": return "'"
+        default: break
+        }
+        guard body.hasPrefix("#") else { return nil }
+        let digits = body.dropFirst()
+        let hex = digits.first == "x" || digits.first == "X"
+        guard let value = UInt32(hex ? digits.dropFirst() : digits, radix: hex ? 16 : 10),
+              let scalar = Unicode.Scalar(value)
+        else { return nil }
+        return String(Character(scalar))
     }
 }

@@ -12,6 +12,10 @@ struct SixBitCode: Codable, Identifiable, Hashable, Sendable {
     /// The code as the six pit fields on the bayonet flange.
     var bits: [Bool] { code.map { $0 == "1" } }
 
+    /// The table lists all 64 code indexes; the unused ones are "N/A"
+    /// placeholders, not lenses, and nothing can be coded as one.
+    var isLens: Bool { lensName.caseInsensitiveCompare("N/A") != .orderedSame }
+
     enum CodingKeys: String, CodingKey {
         case code
         case lensName = "lens_name"
@@ -32,30 +36,51 @@ enum SixBitTable {
         return rows
     }()
 
-    /// Codes grouped by code string (several lens generations can share a code).
-    static let byCode: [String: [SixBitCode]] = Dictionary(grouping: all, by: \.code)
+    /// Lens rows grouped by code string (several lens generations can share a
+    /// code). Placeholders stay in `all` for completeness but not here.
+    static let byCode: [String: [SixBitCode]] = Dictionary(grouping: all.filter(\.isLens), by: \.code)
 
-    /// Unique code strings in table order.
+    /// Unique code strings in table order, placeholders excluded.
     static let uniqueCodes: [String] = {
         var seen = Set<String>()
-        return all.compactMap { seen.insert($0.code).inserted ? $0.code : nil }
+        return all.compactMap { $0.isLens && seen.insert($0.code).inserted ? $0.code : nil }
     }()
 
-    private static let byIdentity: [LensIdentity: SixBitCode] = {
-        var map: [LensIdentity: SixBitCode] = [:]
-        for row in all {
-            if let id = LensNameParser.parse(row.lensName), map[id] == nil {
-                map[id] = row
-            }
+    /// Lens rows by full name, and by name without the generation marker the
+    /// camera never writes.
+    private static let index: (byName: [LensKey: [SixBitCode]], byBase: [String: [SixBitCode]]) = {
+        var byName: [LensKey: [SixBitCode]] = [:]
+        var byBase: [String: [SixBitCode]] = [:]
+        for row in all where row.isLens {
+            guard let key = LensNameParser.key(of: row.lensName) else { continue }
+            byName[key, default: []].append(row)
+            byBase[key.base, default: []].append(row)
         }
-        return map
+        return (byName, byBase)
     }()
 
-    /// Matches a camera-written lens string (e.g. "Noctilux-M 1:1.2/50 ASPH.")
-    /// to its table entry, tolerating the different naming formats Leica uses.
+    /// Matches a lens name in either Leica format (the camera writes
+    /// "Noctilux-M 1:1.2/50 ASPH.", catalogs "Noctilux-M 50mm f/1.2 ASPH") to
+    /// its table row, or nil when the name can't name one code.
     static func match(lensModel: String?) -> SixBitCode? {
-        guard let lensModel, let id = LensNameParser.parse(lensModel) else { return nil }
-        return byIdentity[id]
+        let candidates = matchCandidates(lensModel: lensModel)
+        return candidates.count == 1 ? candidates.first : nil
+    }
+
+    /// The codes a lens name could mean, one row per code. Usually one; more
+    /// when generations of the same lens wear different codes (Elmarit-M
+    /// 28/2.8 III is 000011, IV is 011011) and the name — as camera strings do
+    /// — carries no generation marker. Only the user knows which one is
+    /// engraved, so callers must not guess.
+    static func matchCandidates(lensModel: String?) -> [SixBitCode] {
+        guard let lensModel, let key = LensNameParser.key(of: lensModel) else { return [] }
+        // A name with a generation marker can name its exact row; without one
+        // only the base can decide, and going through byName first would let
+        // an unmarked row win beside marked generations.
+        let rows = key.generation.isEmpty ? index.byBase[key.base] : index.byName[key] ?? index.byBase[key.base]
+        guard let rows else { return [] }
+        var seen = Set<String>()
+        return rows.filter { seen.insert($0.code).inserted }
     }
 
     /// Unique codes ordered by how plausible a borrow they are for the given
@@ -65,18 +90,17 @@ enum SixBitTable {
     static func ranked(for identity: LensIdentity?) -> [String] {
         guard let identity else { return uniqueCodes }
 
-        func score(_ code: String) -> Double {
+        /// Distance of the closest lens behind a code, focal before aperture.
+        func distance(_ code: String) -> (focal: Int, aperture: Int) {
             let ids = (byCode[code] ?? []).compactMap { LensNameParser.parse($0.lensName) }
-            let scores = ids.map { id in
-                Double(abs(id.focalMM - identity.focalMM)) * 10
-                    + Double(abs(id.apertureX10 - identity.apertureX10)) / 10
-            }
-            return scores.min() ?? .greatestFiniteMagnitude
+            return ids.map { (abs($0.focalMM - identity.focalMM),
+                              abs($0.apertureX100 - identity.apertureX100)) }
+                .min { $0 < $1 } ?? (.max, .max)
         }
 
-        let scores = uniqueCodes.map(score)
+        let distances = uniqueCodes.map(distance)
         return uniqueCodes.indices
-            .sorted { scores[$0] == scores[$1] ? $0 < $1 : scores[$0] < scores[$1] }
+            .sorted { distances[$0] == distances[$1] ? $0 < $1 : distances[$0] < distances[$1] }
             .map { uniqueCodes[$0] }
     }
 }
