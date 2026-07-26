@@ -56,6 +56,12 @@ enum ScanBusy {
     }
 }
 
+extension Notification.Name {
+    /// Posted with the lens's `PersistentIdentifier` just before it is deleted,
+    /// so live scan state can let go of it before SwiftData invalidates it.
+    static let uncodedLensWillDelete = Notification.Name("UncodedLensWillDelete")
+}
+
 /// The scan's state, owned above the sidebar switcher so navigating away
 /// from the Scan tab and back doesn't clear the opened folder.
 @Observable
@@ -80,6 +86,31 @@ final class ScanSession {
     var folderReadable = true
 
     @ObservationIgnored var batchTask: Task<Void, Never>?
+    @ObservationIgnored private var lensDeletionObserver: NSObjectProtocol?
 
     var busyNow: Bool { busy != nil }
+
+    init() {
+        lensDeletionObserver = NotificationCenter.default.addObserver(
+            forName: .uncodedLensWillDelete, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let id = note.object as? PersistentIdentifier else { return }
+            self?.dropOverrides(forLens: id)
+        }
+    }
+
+    deinit {
+        if let lensDeletionObserver {
+            NotificationCenter.default.removeObserver(lensDeletionObserver)
+        }
+    }
+
+    /// Overrides hold SwiftData objects; a deleted lens must not stay live in
+    /// the scan or `resolve` would hand an invalidated model to the writer.
+    func dropOverrides(forLens id: PersistentIdentifier) {
+        let stale = overrides.filter { $0.value.persistentModelID == id }.map(\.key)
+        guard !stale.isEmpty else { return }
+        for url in stale { overrides[url] = nil }
+        selection.subtract(stale)
+    }
 }

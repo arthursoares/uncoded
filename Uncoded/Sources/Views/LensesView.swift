@@ -37,7 +37,7 @@ struct LensesView: View {
                                 .onTapGesture { lensToRecode = lens }
                                 .contextMenu {
                                     Button("Change Code…") { lensToRecode = lens }
-                                    Button("Delete", role: .destructive) { context.delete(lens) }
+                                    Button("Delete", role: .destructive) { delete(lens) }
                                 }
                         }
                     }
@@ -56,6 +56,14 @@ struct LensesView: View {
         }
         .sheet(isPresented: $showAdd) { AddLensSheet() }
         .sheet(item: $lensToRecode) { lens in ChangeCodeSheet(lens: lens) }
+    }
+
+    /// A live scan may hold this lens as a per-frame override; tell it to let
+    /// go before SwiftData invalidates the model.
+    private func delete(_ lens: UserLens) {
+        NotificationCenter.default.post(name: .uncodedLensWillDelete,
+                                        object: lens.persistentModelID)
+        context.delete(lens)
     }
 }
 
