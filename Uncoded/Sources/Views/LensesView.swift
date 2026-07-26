@@ -287,18 +287,25 @@ struct AddLensSheet: View {
     }
 }
 
-/// Reassigns which 6-bit code an existing lens wears.
+/// Reassigns which 6-bit code an existing lens wears. A lens can wear more
+/// than one code over its life (re-coded: old files carry A, new ones B), so
+/// the sheet edits the one code it shows and leaves the others alone.
 private struct ChangeCodeSheet: View {
     let lens: UserLens
     @Environment(\.modelContext) private var context
     @Environment(\.dismiss) private var dismiss
     @State private var selection: String?
-    private let hadCode: Bool
+    /// The code the picker opened on — the only one this sheet can change.
+    private let seededCode: String?
 
     init(lens: UserLens) {
         self.lens = lens
-        hadCode = lens.mappings.first != nil
+        seededCode = lens.mappings.first?.code
         _selection = State(initialValue: lens.mappings.first?.code)
+    }
+
+    private var otherCodes: [String] {
+        lens.mappings.map(\.code).filter { $0 != seededCode }.sorted()
     }
 
     var body: some View {
@@ -310,18 +317,35 @@ private struct ChangeCodeSheet: View {
                     .foregroundStyle(Theme.engraved)
             }
 
-            CodePickerList(suggestionSeed: lens.name, selection: $selection)
+            CodePickerList(suggestionSeed: lens.name, selection: $selection,
+                           extraCodes: lens.mappings.map(\.code))
+
+            if !otherCodes.isEmpty {
+                HStack(spacing: 10) {
+                    EngravedLabel("also wears", color: Theme.faint)
+                    ForEach(otherCodes, id: \.self) { code in
+                        HStack(spacing: 5) {
+                            BitPatternView(code: code, dotSize: 7)
+                            Text(code)
+                                .font(Theme.mono(10))
+                                .foregroundStyle(Theme.dim)
+                        }
+                    }
+                    Text("— kept")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.faint)
+                }
+            }
 
             HStack {
                 Button("Cancel") { dismiss() }
                 Spacer()
                 // Clicking the current code again clears the selection, which
                 // un-codes the lens on save — name that instead of letting it
-                // hide behind a plain "Save".
+                // hide behind a plain "Save", and don't put it on Return.
                 if selection == nil {
-                    if hadCode {
+                    if seededCode != nil {
                         Button("Remove Code", role: .destructive) { save() }
-                            .keyboardShortcut(.defaultAction)
                     } else {
                         Text("pick the code this lens wears")
                             .font(.system(size: 10))
@@ -343,7 +367,7 @@ private struct ChangeCodeSheet: View {
     }
 
     private func save() {
-        Mappings.set(code: selection, for: lens, in: context)
+        Mappings.replace(seededCode, with: selection, for: lens, in: context)
         dismiss()
     }
 }
@@ -352,23 +376,27 @@ private struct ChangeCodeSheet: View {
 enum Mappings {
     /// Points `code` at `lens`, stealing it from any other lens that had it.
     static func assign(code: String, to lens: UserLens, in context: ModelContext) {
-        let leicaName = SixBitTable.byCode[code]?.first?.lensName ?? ""
+        // No lens row for a code the table doesn't list (a mapping made before
+        // the placeholder slots were filtered out) — keep whatever name it had.
+        let leicaName = SixBitTable.byCode[code]?.first?.lensName
         let descriptor = FetchDescriptor<CodeMapping>(predicate: #Predicate { $0.code == code })
         if let existing = (try? context.fetch(descriptor))?.first {
             existing.lens = lens
-            existing.leicaLensName = leicaName
+            if let leicaName { existing.leicaLensName = leicaName }
         } else {
-            context.insert(CodeMapping(code: code, leicaLensName: leicaName, lens: lens))
+            context.insert(CodeMapping(code: code, leicaLensName: leicaName ?? "", lens: lens))
         }
     }
 
-    /// Replaces the lens's mapping with `code` (or removes it when nil).
-    static func set(code: String?, for lens: UserLens, in context: ModelContext) {
-        for mapping in lens.mappings where mapping.code != code {
+    /// Swaps one of the lens's codes for another (or drops it when `new` is
+    /// nil). The lens's other codes stay: a re-coded lens really does wear one
+    /// code on its old files and another on the new ones.
+    static func replace(_ old: String?, with new: String?, for lens: UserLens, in context: ModelContext) {
+        if let old, old != new, let mapping = lens.mappings.first(where: { $0.code == old }) {
             context.delete(mapping)
         }
-        if let code, !lens.mappings.contains(where: { $0.code == code }) {
-            assign(code: code, to: lens, in: context)
+        if let new, !lens.mappings.contains(where: { $0.code == new }) {
+            assign(code: new, to: lens, in: context)
         }
     }
 }
