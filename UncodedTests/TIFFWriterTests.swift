@@ -89,7 +89,26 @@ final class TIFFWriterTests: XCTestCase {
     <?xpacket end="w"?>
     """
 
-    private var sampleXMP: String { packet + String(repeating: " ", count: 512) }
+    /// Whitespace padding where the XMP spec puts it: after the XML, *before*
+    /// the trailing `<?xpacket end?>` PI. (v0.1.x wrote it after the trailer,
+    /// which put the padding outside the packet it was meant to pad.)
+    private func padding(_ packet: String, _ count: Int) -> String {
+        packet.replacingOccurrences(of: "<?xpacket end",
+                                    with: String(repeating: " ", count: count) + "<?xpacket end")
+    }
+
+    private var sampleXMP: String { padding(packet, 512) }
+
+    /// The XMP packet as it sits in a file on disk.
+    private func xmpPacket(of url: URL) throws -> String {
+        let data = try Data(contentsOf: url)
+        let layout = try TIFFReader(data: data).structure()
+        let entry = try XCTUnwrap(layout.ifd0[0x02BC], "file has no XMP tag")
+        let offset = Int(try XCTUnwrap(TIFFReader.u32(data, at: entry.fieldOffset,
+                                                     littleEndian: layout.littleEndian)))
+        return try XCTUnwrap(String(data: data.subdata(in: offset..<(offset + entry.count)),
+                                    encoding: .utf8))
+    }
 
     private var voigtlander: LensWrite {
         LensWrite(lensMake: "Voigtlander",
@@ -515,8 +534,22 @@ final class TIFFWriterTests: XCTestCase {
         }
     }
 
+    // MARK: - XMP transform
+
+    /// Wraps rdf:Description bodies in a well-formed packet — every prefix an
+    /// XMP packet uses has to be declared, or it isn't XML.
+    private func wrap(_ descriptions: String) -> String {
+        """
+        <?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+        <x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+        \(descriptions)
+        </rdf:RDF></x:xmpmeta>
+        <?xpacket end="w"?>
+        """
+    }
+
     func testTransformXMPReplacesAndInserts() throws {
-        let xmp = #"<rdf:Description rdf:about="" xmlns:aux="http://ns.adobe.com/exif/1.0/aux/" aux:Lens="Old Lens"/>"#
+        let xmp = wrap(#"<rdf:Description rdf:about="" xmlns:aux="http://ns.adobe.com/exif/1.0/aux/" aux:Lens="Old Lens"/>"#)
         let out = try TIFFWriter.transformXMP(xmp, properties: [
             ("aux:Lens", "New Lens"),
             ("crs:LensProfileName", "Adobe (Profile)"),
@@ -525,24 +558,193 @@ final class TIFFWriterTests: XCTestCase {
         XCTAssertFalse(out.contains("Old Lens"))
         XCTAssertTrue(out.contains(#"crs:LensProfileName="Adobe (Profile)""#))
         XCTAssertTrue(out.contains("xmlns:crs="), "missing namespace must be declared")
+        XCTAssertNoThrow(try XMLDocument(data: Data(out.utf8), options: []))
     }
 
     func testTransformXMPEscapesValues() throws {
-        let out = try TIFFWriter.transformXMP(#"<rdf:Description rdf:about=""/>"#,
+        let out = try TIFFWriter.transformXMP(wrap(#"<rdf:Description rdf:about=""/>"#),
                                               properties: [("aux:Lens", "A \"B\" & <C>")])
         XCTAssertTrue(out.contains("A &quot;B&quot; &amp; &lt;C&gt;"))
+        let parsed = try XMLDocument(data: Data(out.utf8), options: [])
+        XCTAssertTrue(parsed.xmlString.contains("&amp;"), "the escaped value must round-trip")
     }
 
     func testTransformXMPRefusesPacketWithoutDescription() throws {
         // Nowhere to put the properties: reporting success would mean an EXIF-only
         // fix with untouched XMP.
-        let xmp = #"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF/></x:xmpmeta>"#
+        let xmp = #"""
+        <x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"/></x:xmpmeta>
+        """#
         XCTAssertThrowsError(try TIFFWriter.transformXMP(xmp, properties: [("aux:Lens", "L")])) { error in
             guard case TIFFWriteError.xmpMissingDescription = error else {
                 return XCTFail("expected xmpMissingDescription, got \(error)")
             }
         }
-        let packetWithoutDescription = xmp + String(repeating: " ", count: 512)
-        try assertRefuses(makeTIFF(xmp: packetWithoutDescription).data)
+        try assertRefuses(makeTIFF(xmp: padding(xmp, 512)).data)
     }
+
+    func testTransformXMPRefusesMalformedXML() throws {
+        // Not XML at all: the old regex transform happily "edited" text like this
+        // and produced a packet no reader could parse.
+        let broken = wrap(#"<rdf:Description rdf:about="" aux:Lens="unclosed>"#)
+        XCTAssertThrowsError(try TIFFWriter.transformXMP(broken, properties: [("aux:Lens", "L")])) { error in
+            guard case TIFFWriteError.malformedXMP = error else {
+                return XCTFail("expected malformedXMP, got \(error)")
+            }
+        }
+        try assertRefuses(makeTIFF(xmp: padding(broken, 512)).data)
+    }
+
+    func testTransformXMPLeavesOtherDescriptionsAndHistoryAlone() throws {
+        // The regex transform replaced *every* occurrence: a crs:LensProfileName
+        // recorded inside an xmpMM:History entry, or held by a second
+        // rdf:Description, got rewritten along with the real one.
+        let xmp = wrap(#"""
+        <rdf:Description rdf:about="" xmlns:aux="http://ns.adobe.com/exif/1.0/aux/" xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/" aux:Lens="Old Lens" crs:LensProfileName="Old Profile"/>
+        <rdf:Description rdf:about="" xmlns:xmpMM="http://ns.adobe.com/xap/1.0/mm/" xmlns:stEvt="http://ns.adobe.com/xap/1.0/sType/ResourceEvent#">
+         <xmpMM:History><rdf:Seq><rdf:li rdf:parseType="Resource">
+          <stEvt:action>saved</stEvt:action>
+          <stEvt:parameters>crs:LensProfileName="Old Profile"</stEvt:parameters>
+         </rdf:li></rdf:Seq></xmpMM:History>
+        </rdf:Description>
+        """#)
+        let out = try TIFFWriter.transformXMP(xmp, properties: [
+            ("aux:Lens", "New Lens"),
+            ("crs:LensProfileName", "New Profile"),
+        ])
+        XCTAssertTrue(out.contains(#"crs:LensProfileName="New Profile""#))
+        XCTAssertTrue(out.contains(#"<stEvt:parameters>crs:LensProfileName="Old Profile"</stEvt:parameters>"#),
+                      "the history entry is a record of the past, not a property to update")
+        XCTAssertEqual(out.components(separatedBy: "New Profile").count - 1, 1,
+                       "exactly one property may be written")
+    }
+
+    func testTransformXMPSurvivesMarkupInsideAttributeValues() throws {
+        // `>` inside an attribute value used to end the tag as far as the regex
+        // was concerned, so the insertion landed in the middle of a value.
+        let xmp = wrap(#"<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/" dc:title="a &gt; b" dc:rights="x &lt;y&gt; z"/>"#)
+        let out = try TIFFWriter.transformXMP(xmp, properties: [("aux:Lens", "New Lens")])
+        let parsed = try XMLDocument(data: Data(out.utf8), options: [])
+        let description = try XCTUnwrap(parsed.rootElement()?.elements(forName: "rdf:RDF").first?
+            .elements(forName: "rdf:Description").first)
+        XCTAssertEqual(description.attribute(forName: "dc:title")?.stringValue, "a > b")
+        XCTAssertEqual(description.attribute(forName: "aux:Lens")?.stringValue, "New Lens")
+    }
+
+    func testTransformXMPUpdatesElementFormInPlace() throws {
+        // Real M11 files that have been through Lightroom hold aux:LensInfo as a
+        // child element, not an attribute.
+        let xmp = wrap(#"""
+        <rdf:Description rdf:about="" xmlns:aux="http://ns.adobe.com/exif/1.0/aux/">
+         <aux:LensInfo>50/1 50/1 12/10 12/10</aux:LensInfo>
+        </rdf:Description>
+        """#)
+        let out = try TIFFWriter.transformXMP(xmp, properties: [("aux:LensInfo", "35/1 35/1 2/1 2/1")])
+        XCTAssertTrue(out.contains("<aux:LensInfo>35/1 35/1 2/1 2/1</aux:LensInfo>"))
+        XCTAssertFalse(out.contains("12/10"))
+        XCTAssertFalse(out.contains(#"aux:LensInfo=""#), "the element form must not be duplicated")
+    }
+
+    func testTransformXMPKeepsThePacketWrapperAndTrailingBytes() throws {
+        // The M11 writes a NUL byte after the trailer; the packet's PIs and that
+        // byte are not the parser's to reformat.
+        let xmp = "<?xpacket begin=\"\u{FEFF}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n"
+            + #"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about=""/></rdf:RDF></x:xmpmeta>"#
+            + "\n<?xpacket end=\"w\"?>\u{0}"
+        let out = try TIFFWriter.transformXMP(xmp, properties: [("aux:Lens", "L")])
+        XCTAssertTrue(out.hasPrefix("<?xpacket begin=\"\u{FEFF}\""))
+        XCTAssertTrue(out.hasSuffix("<?xpacket end=\"w\"?>\u{0}"))
+    }
+
+    // MARK: - Padding placement
+
+    func testPaddingGoesBeforeTheTrailer() throws {
+        let url = try writeTemp(makeTIFF(xmp: sampleXMP).data)
+        _ = try TIFFWriter.apply(voigtlander, to: url)
+
+        let text = try xmpPacket(of: url)
+        XCTAssertTrue(text.hasSuffix(#"<?xpacket end="w"?>"#),
+                      "the trailer must stay last — padding belongs inside the packet")
+        let trailer = try XCTUnwrap(text.range(of: #"<?xpacket end"#, options: .backwards))
+        XCTAssertTrue(text[..<trailer.lowerBound].hasSuffix("   "), "expected padding before the trailer")
+        XCTAssertNoThrow(try XMLDocument(data: Data(text.utf8), options: []))
+    }
+
+    // MARK: - aux:LensInfo and the crs:LensProfile block
+
+    func testWritesXMPLensInfoAlongsideTheEXIFOne() throws {
+        // exiftool's -LensInfo= populated both copies. Writing only the EXIF one
+        // leaves the camera's aux:LensInfo — the borrowed Leica lens's aperture —
+        // as what Lightroom shows.
+        let withLensInfo = padding(wrap(#"""
+        <rdf:Description rdf:about="" xmlns:aux="http://ns.adobe.com/exif/1.0/aux/" aux:Lens="Noctilux-M 1:1.2/50 ASPH.">
+         <aux:LensInfo>50/1 50/1 12/10 12/10</aux:LensInfo>
+        </rdf:Description>
+        """#), 512)
+        let url = try writeTemp(makeTIFF(xmp: withLensInfo).data)
+        _ = try TIFFWriter.apply(voigtlander, to: url)
+
+        let text = try xmpPacket(of: url)
+        XCTAssertEqual(TIFFReader.xmpValue(text, property: "aux:LensInfo"), "35/1 35/1 2/1 2/1")
+        XCTAssertFalse(text.contains("12/10"), "the borrowed lens's aperture must not survive")
+        XCTAssertEqual(try TIFFReader.read(url: url).lensSpec, "35mm f/2")
+    }
+
+    func testInsertsXMPLensInfoWhenThePacketHasNone() throws {
+        // Straight off the camera there is no aux:LensInfo at all.
+        let url = try writeTemp(makeTIFF(xmp: sampleXMP).data)
+        _ = try TIFFWriter.apply(voigtlander, to: url)
+        XCTAssertEqual(TIFFReader.xmpValue(try xmpPacket(of: url), property: "aux:LensInfo"),
+                       "35/1 35/1 2/1 2/1")
+    }
+
+    func testLensInfoUsesUnreducedRationalsForFractionalSpecs() throws {
+        var write = voigtlander
+        write.focalMM = 50
+        write.apertureF = 1.2
+        XCTAssertEqual(write.xmpLensInfo, "50/1 50/1 12/10 12/10")
+
+        write.focalMM = nil
+        XCTAssertNil(write.xmpLensInfo, "no focal length means nothing truthful to write")
+    }
+
+    func testWritesTheProfileDigest() throws {
+        let url = try writeTemp(makeTIFF(xmp: sampleXMP).data)
+        _ = try TIFFWriter.apply(voigtlander, to: url)
+        XCTAssertEqual(try TIFFReader.read(url: url).profileDigest,
+                       "03CBD374CCB89A292AD832BB830E440F")
+    }
+
+    func testNoProfileMeansNoCRSBlockAtAll() throws {
+        // A hand-typed lens names no Adobe profile. LensProfileSetup="Custom"
+        // beside an empty Digest/Filename/Name is a reference to nothing.
+        var write = voigtlander
+        write.profileName = ""
+        write.profileFilename = ""
+        write.profileDigest = ""
+        XCTAssertFalse(write.hasProfile)
+
+        let url = try writeTemp(makeTIFF(xmp: sampleXMP).data)
+        _ = try TIFFWriter.apply(write, to: url)
+
+        let text = try xmpPacket(of: url)
+        XCTAssertFalse(text.contains("crs:LensProfile"), "expected no crs:LensProfile* at all")
+        XCTAssertEqual(TIFFReader.xmpValue(text, property: "aux:Lens"),
+                       "Voigtlander VM 35mm f/2 Ultron Aspherical",
+                       "the lens name is still written")
+    }
+
+    func testEmptyProfileFieldsAreSkippedIndividually() throws {
+        // A lens row from v0.1.x that could not be backfilled still has a name
+        // and a filename: write those, and no empty digest next to them.
+        var write = voigtlander
+        write.profileDigest = ""
+        let properties = TIFFWriter.xmpProperties(for: write)
+        let names = properties.map(\.0)
+        XCTAssertTrue(names.contains("crs:LensProfileName"))
+        XCTAssertTrue(names.contains("crs:LensProfileSetup"))
+        XCTAssertFalse(names.contains("crs:LensProfileDigest"))
+        XCTAssertTrue(properties.allSatisfy { !$0.1.isEmpty })
+    }
+
 }

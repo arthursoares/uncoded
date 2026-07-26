@@ -9,6 +9,43 @@ struct LensWrite: Sendable {
     var profileName: String
     var profileFilename: String
     var profileDigest: String
+
+    /// Whether this lens names an Adobe correction profile at all. A lens the
+    /// user typed in by hand names none — and then there is nothing truthful to
+    /// put in `crs:LensProfile*`.
+    var hasProfile: Bool {
+        !(profileName.isEmpty && profileFilename.isEmpty && profileDigest.isEmpty)
+    }
+
+    /// XMP `aux:LensInfo`: min focal, max focal, min aperture, max aperture as
+    /// space-separated rationals — the XMP twin of EXIF LensSpecification.
+    ///
+    /// The CLI's `exiftool -LensInfo=` populated *both* ExifIFD:LensInfo and
+    /// XMP-aux:LensInfo. Writing only the EXIF one leaves the camera's original
+    /// aux:LensInfo in place, which describes the *borrowed* Leica lens —
+    /// usually at the wrong maximum aperture — and that is the copy Lightroom
+    /// shows.
+    var xmpLensInfo: String? {
+        guard let focal = focalMM, let aperture = apertureF,
+              let f = Self.rational(focal), let a = Self.rational(aperture)
+        else { return nil }
+        return "\(f) \(f) \(a) \(a)"
+    }
+
+    /// The shortest exact rational for a lens number: 35 → "35/1", 1.8 → "18/10".
+    /// Unreduced denominators are valid XMP and are what Lightroom writes.
+    private static func rational(_ v: Double) -> String? {
+        guard v.isFinite, v > 0, v <= 1_000_000 else { return nil }
+        var denominator = 1
+        while denominator <= 1000 {
+            let scaled = v * Double(denominator)
+            if abs(scaled - scaled.rounded()) < 1e-6, scaled <= Double(UInt32.max) {
+                return "\(Int(scaled.rounded()))/\(denominator)"
+            }
+            denominator *= 10
+        }
+        return nil
+    }
 }
 
 /// One in-place byte patch, with the original bytes for revert.
@@ -98,6 +135,7 @@ enum TIFFWriteError: Error, LocalizedError {
     case fileChangedSinceFix
     case nonTextTag(tag: UInt16, type: UInt16)
     case undecodableXMP
+    case malformedXMP(String)
     case xmpMissingDescription
     case invalidValue(String)
     case fileTooLarge
@@ -117,6 +155,8 @@ enum TIFFWriteError: Error, LocalizedError {
             """, tag, type)
         case .undecodableXMP:
             return "This file's XMP block is not UTF-8 text. Rewriting it would throw away metadata Uncoded cannot read (develop settings, ratings, GPS), so the file is left untouched."
+        case .malformedXMP(let detail):
+            return "This file's XMP block is not well-formed XML (\(detail)). Uncoded will not guess at where the lens properties belong in it, so the file is left untouched."
         case .xmpMissingDescription:
             return "This file's XMP block has no rdf:Description element to hold the lens properties; refusing rather than reporting a fix that only half happened."
         case .invalidValue(let detail): return detail
@@ -339,14 +379,7 @@ struct TIFFWriter {
     /// whitespace padding; grew → EOF append + entry re-point; missing → new
     /// packet + IFD0 rebuild.
     private mutating func setXMP(_ write: LensWrite, newExifOffset: UInt32?) throws {
-        let properties: [(String, String)] = [
-            ("aux:Lens", write.lensModel),
-            ("crs:LensProfileSetup", "Custom"),
-            ("crs:LensProfileName", write.profileName),
-            ("crs:LensProfileFilename", write.profileFilename),
-            ("crs:LensProfileDigest", write.profileDigest),
-            ("crs:LensProfileIsEmbedded", "False"),
-        ]
+        let properties = Self.xmpProperties(for: write)
 
         if let entry = layout.ifd0[Tag.xmp] {
             // entry.count is only a byte count for the one-byte-per-component
@@ -364,16 +397,14 @@ struct TIFFWriter {
             guard let oldXMP = String(data: oldBytes, encoding: .utf8) else {
                 throw TIFFWriteError.undecodableXMP
             }
-            var newBytes = Data(try Self.transformXMP(oldXMP, properties: properties).utf8)
-            // The old packet's whitespace padding rides along in the transform;
-            // strip it so the size check sees the real content, then re-pad.
-            while let last = newBytes.last, last == 0x20 || last == 0x0A || last == 0x0D || last == 0x09 {
-                newBytes.removeLast()
-            }
+            // transformXMP drops the old packet's padding, so this is the real
+            // content size; the padding to fill the slot goes back on after.
+            let newPacket = try Self.transformXMP(oldXMP, properties: properties)
+            let newBytes = Data(newPacket.utf8)
 
             if newBytes.count <= entry.count {
-                newBytes.append(Data(repeating: 0x20, count: entry.count - newBytes.count))
-                try patch(at: Int(valueOffset), newBytes, kind: .value)
+                try patch(at: Int(valueOffset),
+                          Self.padded(newPacket, toByteCount: entry.count), kind: .value)
             } else {
                 let offset = try u32Offset(append(newBytes))
                 try setCountAndField(entry, count: newBytes.count, field: u32Bytes(offset))
@@ -462,58 +493,192 @@ struct TIFFWriter {
         "crs": "http://ns.adobe.com/camera-raw-settings/1.0/",
     ]
 
-    /// Sets each property in the XMP text, replacing existing attribute or
-    /// element forms, or inserting attributes on the first rdf:Description
-    /// (declaring the namespace there when the document lacks it).
-    static func transformXMP(_ xmp: String, properties: [(String, String)]) throws -> String {
-        var result = xmp
-        for (name, value) in properties {
-            let escapedName = NSRegularExpression.escapedPattern(for: name)
-            let escapedValue = xmlEscape(value)
-
-            let attrPattern = escapedName + #"\s*=\s*"[^"]*""#
-            if let regex = try? NSRegularExpression(pattern: attrPattern),
-               regex.firstMatch(in: result, range: NSRange(result.startIndex..., in: result)) != nil {
-                result = regex.stringByReplacingMatches(
-                    in: result, range: NSRange(result.startIndex..., in: result),
-                    withTemplate: NSRegularExpression.escapedTemplate(for: "\(name)=\"\(escapedValue)\""))
-                continue
-            }
-
-            let elemPattern = "(<" + escapedName + #"(?:\s[^>]*)?>)[^<]*(</"# + escapedName + ">)"
-            if let regex = try? NSRegularExpression(pattern: elemPattern),
-               regex.firstMatch(in: result, range: NSRange(result.startIndex..., in: result)) != nil {
-                result = regex.stringByReplacingMatches(
-                    in: result, range: NSRange(result.startIndex..., in: result),
-                    withTemplate: "$1" + NSRegularExpression.escapedTemplate(for: escapedValue) + "$2")
-                continue
-            }
-
-            // Insert as attribute on the first rdf:Description. The namespace
-            // must be declared in scope of THAT element (ancestors or the
-            // element itself) — a declaration on a later sibling doesn't count.
-            // No such element: silently dropping the property would report a
-            // fix that only touched EXIF.
-            guard let tagStart = result.range(of: "<rdf:Description") else {
-                throw TIFFWriteError.xmpMissingDescription
-            }
-            let tagEnd = result[tagStart.upperBound...].firstIndex(of: ">") ?? result.endIndex
-            let scope = result[..<tagEnd]
-            var insertion = " \(name)=\"\(escapedValue)\""
-            let prefix = String(name.prefix(while: { $0 != ":" }))
-            if let uri = namespaces[prefix], !scope.contains("xmlns:\(prefix)") {
-                insertion = " xmlns:\(prefix)=\"\(uri)\"" + insertion
-            }
-            result.insert(contentsOf: insertion, at: tagStart.upperBound)
+    /// The XMP properties one lens implies, in the order they are applied.
+    ///
+    /// A lens with no Adobe profile gets no `crs:LensProfile*` at all, and an
+    /// empty value is never written: `LensProfileSetup="Custom"` beside an empty
+    /// Digest/Filename/Name is a profile reference that names nothing, which is
+    /// the leading explanation for fixes that changed the metadata and yet did
+    /// nothing visible in Lightroom.
+    static func xmpProperties(for write: LensWrite) -> [(String, String)] {
+        var properties: [(String, String)] = [("aux:Lens", write.lensModel)]
+        if let info = write.xmpLensInfo {
+            properties.append(("aux:LensInfo", info))
         }
-        return result
+        guard write.hasProfile else { return properties }
+        properties.append(("crs:LensProfileSetup", "Custom"))
+        properties.append(("crs:LensProfileIsEmbedded", "False"))
+        for (name, value) in [("crs:LensProfileName", write.profileName),
+                              ("crs:LensProfileFilename", write.profileFilename),
+                              ("crs:LensProfileDigest", write.profileDigest)]
+        where !value.isEmpty {
+            properties.append((name, value))
+        }
+        return properties
     }
 
-    private static func xmlEscape(_ s: String) -> String {
-        s.replacingOccurrences(of: "&", with: "&amp;")
-            .replacingOccurrences(of: "<", with: "&lt;")
-            .replacingOccurrences(of: ">", with: "&gt;")
-            .replacingOccurrences(of: "\"", with: "&quot;")
+    /// Sets each property in an XMP packet, replacing whichever form (attribute
+    /// or element) the packet already uses and inserting an attribute otherwise.
+    ///
+    /// The XML in the packet is parsed, not pattern-matched: only a parser can
+    /// tell `crs:LensProfileName` *of* an rdf:Description from the same text
+    /// inside an `xmpMM:History` entry or a second Description, and only a
+    /// parser knows that a `>` inside an attribute value doesn't end the tag.
+    /// The `<?xpacket?>` processing instructions are peeled off and put back
+    /// verbatim instead: the header carries a BOM, real M11 packets have a NUL
+    /// byte after the trailer, and neither belongs to the document.
+    static func transformXMP(_ xmp: String, properties: [(String, String)]) throws -> String {
+        let packet = Packet(xmp)
+        let document: XMLDocument
+        do {
+            // External entities are never resolved: this is XML out of a file we
+            // did not write, and an XMP packet has no business fetching a DTD.
+            document = try XMLDocument(xmlString: packet.body,
+                                       options: [.nodePreserveWhitespace, .nodePreserveCDATA,
+                                                 .nodeLoadExternalEntitiesNever])
+        } catch {
+            throw TIFFWriteError.malformedXMP(error.localizedDescription)
+        }
+
+        let descriptions = allDescriptions(in: document)
+        // Prefer the Description that already carries the lens vocabulary — the
+        // camera and Lightroom keep aux:/crs: together — else the first one.
+        // None at all means there is nowhere to write, and reporting success
+        // would mean an EXIF-only fix with the XMP untouched.
+        guard let primary = descriptions.first(where: carriesLensVocabulary) ?? descriptions.first
+        else { throw TIFFWriteError.xmpMissingDescription }
+
+        for (name, value) in properties {
+            // A property already present somewhere is updated *there*: adding a
+            // second copy on `primary` would make the packet contradict itself.
+            let target = descriptions.first { holds(name, $0) } ?? primary
+            set(name, to: value, on: target)
+        }
+
+        let body = (document.children ?? [])
+            .map { $0.xmlString(options: [.nodePreserveWhitespace]) }
+            .joined()
+        return packet.reassembled(body: body)
+    }
+
+    /// Every rdf:Description in the document, in document order.
+    private static func allDescriptions(in node: XMLNode) -> [XMLElement] {
+        var found: [XMLElement] = []
+        if let element = node as? XMLElement, element.name == "rdf:Description" {
+            found.append(element)
+        }
+        for child in node.children ?? [] {
+            found.append(contentsOf: allDescriptions(in: child))
+        }
+        return found
+    }
+
+    private static func carriesLensVocabulary(_ element: XMLElement) -> Bool {
+        let names = (element.attributes ?? []).compactMap(\.name)
+            + (element.children ?? []).compactMap { ($0 as? XMLElement)?.name }
+        return names.contains { $0.hasPrefix("aux:") || $0.hasPrefix("crs:") }
+    }
+
+    private static func holds(_ name: String, _ element: XMLElement) -> Bool {
+        element.attribute(forName: name) != nil || !childElements(name, of: element).isEmpty
+    }
+
+    private static func childElements(_ name: String, of element: XMLElement) -> [XMLElement] {
+        (element.children ?? []).compactMap { $0 as? XMLElement }.filter { $0.name == name }
+    }
+
+    /// Writes one property onto one Description, keeping whichever form the
+    /// packet already uses. A property held as both attribute and element is a
+    /// duplicate either way, so the element form is dropped.
+    private static func set(_ name: String, to value: String, on element: XMLElement) {
+        if let attribute = element.attribute(forName: name) {
+            attribute.stringValue = value
+            for stale in childElements(name, of: element) { stale.detach() }
+            return
+        }
+        if let existing = childElements(name, of: element).first {
+            existing.stringValue = value
+            return
+        }
+        declareNamespace(for: name, on: element)
+        if let attribute = XMLNode.attribute(withName: name, stringValue: value) as? XMLNode {
+            element.addAttribute(attribute)
+        }
+    }
+
+    /// A prefixed attribute needs its namespace declared in scope of the element
+    /// itself or an ancestor — a declaration on a sibling Description, which is
+    /// how Lightroom writes them, does not count.
+    private static func declareNamespace(for name: String, on element: XMLElement) {
+        let prefix = String(name.prefix(while: { $0 != ":" }))
+        guard let uri = namespaces[prefix] else { return }
+        var scope: XMLElement? = element
+        while let current = scope {
+            if (current.namespaces ?? []).contains(where: { $0.name == prefix }) { return }
+            scope = current.parent as? XMLElement
+        }
+        if let declaration = XMLNode.namespace(withName: prefix, stringValue: uri) as? XMLNode {
+            element.addNamespace(declaration)
+        }
+    }
+
+    /// Grows a packet to exactly `byteCount` bytes with whitespace padding,
+    /// placed where the XMP spec puts it: after the XML and *before* the
+    /// `<?xpacket end?>` trailer, so a reader that stops at the trailer has
+    /// already seen the whole document. (v0.1.x appended it after the trailer.)
+    static func padded(_ packet: String, toByteCount byteCount: Int) -> Data {
+        let bytes = Data(packet.utf8)
+        guard byteCount > bytes.count else { return bytes }
+        // One byte per space in UTF-8, so the resulting length is exact.
+        let spaces = String(repeating: " ", count: byteCount - bytes.count)
+        guard let trailer = packet.range(of: Packet.trailerMarker, options: .backwards) else {
+            return bytes + Data(spaces.utf8)
+        }
+        var padded = packet
+        padded.insert(contentsOf: spaces, at: trailer.lowerBound)
+        return Data(padded.utf8)
+    }
+
+    /// An XMP packet split into the parts an XML parser must not own: the
+    /// `<?xpacket begin?>` header, the XML body, and the `<?xpacket end?>`
+    /// trailer plus whatever the camera left after it (the M11 writes a NUL).
+    struct Packet {
+        static let trailerMarker = "<?xpacket end"
+
+        let head: String
+        let body: String
+        let tail: String
+
+        init(_ xmp: String) {
+            // Trailing whitespace is padding that v0.1.x put on the wrong side
+            // of the trailer; drop it and let the writer re-pad properly.
+            var text = xmp
+            while let last = text.last, last.isWhitespace { text.removeLast() }
+
+            var rest = Substring(text)
+            var head = ""
+            if let begin = rest.range(of: "<?xpacket"),
+               rest[..<begin.lowerBound].allSatisfy({ $0.isWhitespace || $0 == "\u{FEFF}" }),
+               let close = rest.range(of: "?>", range: begin.upperBound..<rest.endIndex) {
+                head = String(rest[..<close.upperBound])
+                rest = rest[close.upperBound...]
+            }
+            var tail = ""
+            if let end = rest.range(of: Self.trailerMarker, options: .backwards) {
+                tail = String(rest[end.lowerBound...])
+                rest = rest[..<end.lowerBound]
+            }
+            self.head = head
+            self.tail = tail
+            self.body = String(rest)
+        }
+
+        func reassembled(body: String) -> String {
+            var out = head.isEmpty ? "" : head + "\n"
+            out += body
+            if !tail.isEmpty { out += "\n" + tail }
+            return out
+        }
     }
 
     // MARK: - Patch/append plumbing

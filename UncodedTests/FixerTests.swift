@@ -26,7 +26,16 @@ final class FixerTests: XCTestCase {
 
     private func makeTIFF() -> Data {
         let lensModel = Data("Summicron-M 1:2/35 ASPH.".utf8) + Data([0])
-        let xmp = Data((#"<rdf:Description rdf:about=""/>"# + String(repeating: " ", count: 600)).utf8)
+        // A well-formed packet: every prefix declared, and the padding on the
+        // inside of the trailer where the XMP spec puts it.
+        let packet = #"""
+        <?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+        <x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+        <rdf:Description rdf:about=""/>
+        </rdf:RDF></x:xmpmeta>
+        \#(String(repeating: " ", count: 600))<?xpacket end="w"?>
+        """#
+        let xmp = Data(packet.utf8)
         let ifd0Offset = 8
         let ifd0Size = 2 + 2 * 12 + 4
         let xmpOff = ifd0Offset + ifd0Size
@@ -238,7 +247,9 @@ final class FixerTests: XCTestCase {
         // Something else edits the file between the two fixes (Lightroom
         // writing metadata back, say): our .bak no longer matches it.
         var edited = original
-        edited[100] = 0x0A // inside the XMP packet's padding
+        // Inside the XMP packet's padding: the bytes differ, the structure holds.
+        let padding = try XCTUnwrap(edited.range(of: Data(repeating: 0x20, count: 64)))
+        edited[padding.lowerBound + 8] = 0x0A
         try edited.write(to: file)
 
         let outcome = try fixer.fix(file: file, with: otherWrite, keepBak: true)
