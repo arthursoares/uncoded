@@ -289,23 +289,26 @@ struct AddLensSheet: View {
 
 /// Reassigns which 6-bit code an existing lens wears. A lens can wear more
 /// than one code over its life (re-coded: old files carry A, new ones B), so
-/// the sheet edits the one code it shows and leaves the others alone.
+/// the sheet edits one of them at a time and leaves the others alone.
 private struct ChangeCodeSheet: View {
     let lens: UserLens
     @Environment(\.modelContext) private var context
     @Environment(\.dismiss) private var dismiss
     @State private var selection: String?
-    /// The code the picker opened on — the only one this sheet can change.
-    private let seededCode: String?
+    /// Which of the lens's existing codes is being edited. `mappings` has no
+    /// stable order, so a lens wearing several lets the user say which.
+    @State private var editing: String?
+    private let currentCodes: [String]
 
     init(lens: UserLens) {
         self.lens = lens
-        seededCode = lens.mappings.first?.code
-        _selection = State(initialValue: lens.mappings.first?.code)
+        currentCodes = lens.mappings.map(\.code).sorted()
+        _editing = State(initialValue: currentCodes.first)
+        _selection = State(initialValue: currentCodes.first)
     }
 
-    private var otherCodes: [String] {
-        lens.mappings.map(\.code).filter { $0 != seededCode }.sorted()
+    private var keptCodes: [String] {
+        currentCodes.filter { $0 != editing }
     }
 
     var body: some View {
@@ -317,13 +320,30 @@ private struct ChangeCodeSheet: View {
                     .foregroundStyle(Theme.engraved)
             }
 
-            CodePickerList(suggestionSeed: lens.name, selection: $selection,
-                           extraCodes: lens.mappings.map(\.code))
+            if currentCodes.count > 1 {
+                VStack(alignment: .leading, spacing: 6) {
+                    EngravedLabel("editing", color: Theme.faint)
+                    HStack(spacing: 8) {
+                        ForEach(currentCodes, id: \.self) { code in
+                            Button {
+                                editing = code
+                                selection = code
+                            } label: {
+                                codeChip(code, active: editing == code)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
 
-            if !otherCodes.isEmpty {
+            CodePickerList(suggestionSeed: lens.name, selection: $selection,
+                           extraCodes: currentCodes)
+
+            if !keptCodes.isEmpty {
                 HStack(spacing: 10) {
                     EngravedLabel("also wears", color: Theme.faint)
-                    ForEach(otherCodes, id: \.self) { code in
+                    ForEach(keptCodes, id: \.self) { code in
                         HStack(spacing: 5) {
                             BitPatternView(code: code, dotSize: 7)
                             Text(code)
@@ -344,7 +364,7 @@ private struct ChangeCodeSheet: View {
                 // un-codes the lens on save — name that instead of letting it
                 // hide behind a plain "Save", and don't put it on Return.
                 if selection == nil {
-                    if seededCode != nil {
+                    if editing != nil {
                         Button("Remove Code", role: .destructive) { save() }
                     } else {
                         Text("pick the code this lens wears")
@@ -366,8 +386,29 @@ private struct ChangeCodeSheet: View {
         .preferredColorScheme(.dark)
     }
 
+    /// One of the lens's codes, engraved on a small plate.
+    private func codeChip(_ code: String, active: Bool) -> some View {
+        HStack(spacing: 6) {
+            BitPatternView(code: code, dotSize: 7)
+            Text(code)
+                .font(Theme.mono(10))
+                .foregroundStyle(active ? Theme.engraved : Theme.dim)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(
+            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                .fill(Theme.panel)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .strokeBorder(active ? Theme.accent.opacity(0.8) : Theme.panelEdge, lineWidth: 1)
+                )
+        )
+        .contentShape(Rectangle())
+    }
+
     private func save() {
-        Mappings.replace(seededCode, with: selection, for: lens, in: context)
+        Mappings.replace(editing, with: selection, for: lens, in: context)
         dismiss()
     }
 }
