@@ -8,10 +8,14 @@ struct CodePickerList: View {
     /// Called when the user explicitly clicks a code (as opposed to the
     /// selection being set programmatically by a suggestion).
     var onUserSelect: (() -> Void)? = nil
+    /// Codes to list even when no Leica lens wears them — a lens mapped to a
+    /// placeholder slot in an older version must stay visible and re-pickable.
+    var extraCodes: [String] = []
     @State private var search = ""
 
     private var ranked: [String] {
-        let codes = SixBitTable.ranked(for: LensNameParser.parse(suggestionSeed))
+        var codes = SixBitTable.ranked(for: LensNameParser.parse(suggestionSeed))
+        codes += extraCodes.filter { !codes.contains($0) }
         guard !search.isEmpty else { return codes }
         return codes.filter { code in
             Search.matches(search, in: [code] + (SixBitTable.byCode[code] ?? []).map(\.lensName))
@@ -48,12 +52,12 @@ struct CodePickerList: View {
                                     .foregroundStyle(Theme.accent)
                             }
                         }
-                        Text(entries.first?.lensName ?? "")
+                        Text(entries.first?.lensName ?? "no Leica lens wears this code")
                             .font(.system(size: 11))
                             .foregroundStyle(Theme.dim)
                             .fixedSize(horizontal: false, vertical: true)
                         if entries.count > 1 {
-                            Text("+ \(entries.count - 1) generation\(entries.count > 2 ? "s" : "")")
+                            Text("+ \(entries.count - 1) more")
                                 .font(.system(size: 9))
                                 .foregroundStyle(Theme.faint)
                         }

@@ -1,7 +1,7 @@
 import SwiftUI
 import SwiftData
 
-/// The full 6-bit code table, each code drawn as its flange pit pattern,
+/// Every 6-bit code a Leica M lens wears, drawn as its flange pit pattern,
 /// with the user's mapping (borrowed code -> real lens) shown in place.
 struct CodesView: View {
     @Query private var mappings: [CodeMapping]

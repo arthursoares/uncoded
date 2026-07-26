@@ -26,6 +26,10 @@ targets:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.photography
         INFOPLIST_KEY_NSHumanReadableCopyright: "© 2026 Arthur Soares"
+        INFOPLIST_KEY_NSDesktopFolderUsageDescription: "Uncoded reads the lens metadata of DNGs you point it at, and rewrites it only when you confirm."
+        INFOPLIST_KEY_NSDocumentsFolderUsageDescription: "Uncoded reads the lens metadata of DNGs you point it at, and rewrites it only when you confirm."
+        INFOPLIST_KEY_NSDownloadsFolderUsageDescription: "Uncoded reads the lens metadata of DNGs you point it at, and rewrites it only when you confirm."
+        INFOPLIST_KEY_NSRemovableVolumesUsageDescription: "Uncoded reads DNGs from cards and external drives, and rewrites lens metadata only when you confirm."
         ENABLE_HARDENED_RUNTIME: YES
         COMBINE_HIDPI_IMAGES: YES
     scheme:
