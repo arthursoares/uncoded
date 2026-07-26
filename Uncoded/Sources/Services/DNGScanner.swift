@@ -30,25 +30,42 @@ struct ScannedDNG: Identifiable, Hashable, Sendable {
 
 /// Recursively scans folders for DNGs and reads their lens claims.
 enum DNGScanner {
-    static func scan(folder: URL) -> [ScannedDNG] {
+    /// What a scan found. An empty `files` list is ambiguous on its own —
+    /// no DNGs, DNGs we weren't allowed to read, or a folder that never
+    /// opened — so the counts travel with it.
+    struct Outcome: Sendable {
+        var files: [ScannedDNG] = []
+        var unreadable = 0
+        var folderReadable = true
+    }
+
+    static func scan(folder: URL) -> Outcome {
         let fm = FileManager.default
         var urls: [URL] = []
 
         if folder.hasDirectoryPath {
-            guard let found = fm.enumerator(at: folder, includingPropertiesForKeys: nil) else { return [] }
+            guard fm.isReadableFile(atPath: folder.path),
+                  let found = fm.enumerator(at: folder, includingPropertiesForKeys: nil)
+            else { return Outcome(folderReadable: false) }
             for case let url as URL in found where url.pathExtension.lowercased() == "dng" {
                 urls.append(url)
             }
         } else if folder.pathExtension.lowercased() == "dng" {
             urls = [folder]
+        } else if !fm.isReadableFile(atPath: folder.path) {
+            return Outcome(folderReadable: false)
         }
 
-        return urls
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
-            .compactMap { url in
-                guard let meta = try? TIFFReader.read(url: url) else { return nil }
-                return ScannedDNG(url: url, meta: meta,
-                                  codeCandidates: SixBitTable.matchCandidates(lensModel: meta.lensModel))
+        var outcome = Outcome()
+        for url in urls.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+            guard let meta = try? TIFFReader.read(url: url) else {
+                outcome.unreadable += 1
+                continue
             }
+            outcome.files.append(ScannedDNG(
+                url: url, meta: meta,
+                codeCandidates: SixBitTable.matchCandidates(lensModel: meta.lensModel)))
+        }
+        return outcome
     }
 }
