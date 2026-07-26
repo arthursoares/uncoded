@@ -284,8 +284,12 @@ struct AddLensSheet: View {
     }
 
     private func save() {
-        let lens = UserLens(name: name, make: make, focalLength: focalLength,
-                            aperture: aperture, profileName: profileName,
+        // The name is written into the file and read back trimmed, so stray
+        // whitespace here would read as a mismatch on every later scan.
+        let trim = { (s: String) in s.trimmingCharacters(in: .whitespacesAndNewlines) }
+        let lens = UserLens(name: trim(name), make: trim(make),
+                            focalLength: trim(focalLength), aperture: trim(aperture),
+                            profileName: profileName,
                             profileFilename: profileFilename)
         context.insert(lens)
         if let code = selectedCode {

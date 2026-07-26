@@ -23,42 +23,117 @@ struct ScanView: View {
 
     private enum FixScope { case all, marked }
 
-    /// A frame ready to be written, and whether this is its first fix or a
-    /// rewrite because the user re-assigned it after it was already fixed.
+    /// Why a frame is in the fix set — first write, rewrite after the user
+    /// re-assigned an already-fixed frame, or a retry of a failed write.
+    private enum FixKind { case first, refix, retry }
+
     private struct FixTarget {
         let file: ScannedDNG
         let lens: UserLens
-        let isRefix: Bool
+        let kind: FixKind
     }
 
-    private var mappingByCode: [String: CodeMapping] {
-        Dictionary(mappings.map { ($0.code, $0) }, uniquingKeysWith: { a, _ in a })
-    }
+    /// One pass over the scan: what every frame resolves to, what a Fix would
+    /// write, and the header counts. Built once per render so cells do O(1)
+    /// lookups instead of re-walking the results.
+    private struct ScanPlan {
+        private(set) var resolutions: [URL: Resolution] = [:]
+        private(set) var targets: [FixTarget] = [] // scan order
+        private(set) var targetByURL: [URL: FixTarget] = [:]
+        private(set) var codedCount = 0
+        private(set) var mappedCount = 0
+        private(set) var fixedCount = 0
+        private(set) var failureCount = 0
+        private(set) var unclaimedCodes: [String: Int] = [:]
 
-    /// Everything the Fix button would write: unfixed frames that resolve to a
-    /// lens, plus fixed frames the user has since pointed at a different lens
-    /// (the file claims what we wrote, so a mismatch means "rewrite me").
-    private var fixTargets: [FixTarget] {
-        session.results.compactMap { file in
-            guard let lens = resolve(file).lens else { return nil }
-            switch session.fixState[file.url] {
-            case nil:
-                return FixTarget(file: file, lens: lens, isRefix: false)
-            case .fixed, .revertRefused:
-                guard file.claimedLens != lens.name else { return nil }
-                return FixTarget(file: file, lens: lens, isRefix: true)
-            case .failed:
-                return nil
+        init(session: ScanSession, mappings: [CodeMapping]) {
+            // The lens each mapped code points at. First row wins per code.
+            var lensByCode: [String: UserLens] = [:]
+            var seen = Set<String>()
+            for mapping in mappings where seen.insert(mapping.code).inserted {
+                if let lens = mapping.lens { lensByCode[mapping.code] = lens }
             }
+
+            for file in session.results {
+                let resolution: Resolution
+                if let manual = session.overrides[file.url] {
+                    resolution = Resolution(lens: manual, isManual: true)
+                } else if let lens = file.mappedLens({ lensByCode[$0] }) {
+                    // When the camera string can't say which generation it is,
+                    // the codes the user mapped say which lens they engraved.
+                    resolution = Resolution(lens: lens, isManual: false)
+                } else {
+                    resolution = Resolution(lens: nil, isManual: false)
+                }
+                resolutions[file.url] = resolution
+
+                let state = session.fixState[file.url]
+                if file.matchedCode != nil { codedCount += 1 }
+                if resolution.lens != nil { mappedCount += 1 }
+                if state?.isFixed == true { fixedCount += 1 }
+                if state?.isFailure == true { failureCount += 1 }
+                if let code = file.matchedCode?.code, resolution.lens == nil, state == nil {
+                    unclaimedCodes[code, default: 0] += 1
+                }
+                if let target = Self.target(file: file, lens: resolution.lens, state: state) {
+                    targets.append(target)
+                    targetByURL[file.url] = target
+                }
+            }
+        }
+
+        /// Frames that resolve to a lens and still need a write: never fixed,
+        /// a failed write worth retrying (nothing was committed), or a fixed
+        /// frame whose lens no longer matches what the file claims.
+        private static func target(file: ScannedDNG, lens: UserLens?,
+                                   state: FrameFix?) -> FixTarget? {
+            guard let lens else { return nil }
+            switch state {
+            case nil:
+                return FixTarget(file: file, lens: lens, kind: .first)
+            case .failed:
+                return FixTarget(file: file, lens: lens, kind: .retry)
+            case .fixed, .revertRefused:
+                // The reader trims what it reads, so compare trimmed.
+                let claimed = file.claimedLens?.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard claimed != lens.name.trimmingCharacters(in: .whitespacesAndNewlines) else {
+                    return nil
+                }
+                return FixTarget(file: file, lens: lens, kind: .refix)
+            }
+        }
+
+        func resolution(for file: ScannedDNG) -> Resolution {
+            resolutions[file.url] ?? Resolution(lens: nil, isManual: false)
+        }
+
+        /// The lens a fixed frame has since been re-assigned to, if any.
+        func refixLens(for file: ScannedDNG) -> UserLens? {
+            guard let target = targetByURL[file.url], target.kind == .refix else { return nil }
+            return target.lens
+        }
+
+        /// The most frequent unclaimed code — the one to suggest claiming first.
+        var topUnclaimedCode: (code: String, count: Int)? {
+            guard let best = unclaimedCodes.max(by: { ($0.value, $1.key) < ($1.value, $0.key) })
+            else { return nil }
+            return (best.key, best.value)
         }
     }
 
-    private var markedTargets: [FixTarget] {
-        fixTargets.filter { session.selection.contains($0.file.url) }
+    /// While the grid is filtered to failures, Fix acts on what's visible —
+    /// a button that counts hidden frames would be lying.
+    private func allTargets(_ plan: ScanPlan) -> [FixTarget] {
+        guard session.showFailuresOnly, plan.failureCount > 0 else { return plan.targets }
+        return plan.targets.filter { $0.kind == .retry }
     }
 
-    private var scopedTargets: [FixTarget] {
-        fixScope == .marked ? markedTargets : fixTargets
+    private func markedTargets(_ plan: ScanPlan) -> [FixTarget] {
+        allTargets(plan).filter { session.selection.contains($0.file.url) }
+    }
+
+    private func scopedTargets(_ plan: ScanPlan) -> [FixTarget] {
+        fixScope == .marked ? markedTargets(plan) : allTargets(plan)
     }
 
     /// Marked frames whose bytes on disk are ours — the batch-revert set.
@@ -68,40 +143,22 @@ struct ScanView: View {
         }
     }
 
-    private var failureCount: Int {
-        session.fixState.values.filter(\.isFailure).count
-    }
-
-    /// Frames wearing a code that doesn't resolve to any of the user's lenses.
-    private var unclaimedCoded: [ScannedDNG] {
-        session.results.filter {
-            $0.matchedCode != nil && resolve($0).lens == nil && session.fixState[$0.url] == nil
-        }
-    }
-
-    /// The most frequent unclaimed code — the one to suggest claiming first.
-    private var topUnclaimedCode: (code: String, count: Int)? {
-        let counts = Dictionary(grouping: unclaimedCoded.compactMap { $0.matchedCode?.code }, by: { $0 })
-            .mapValues(\.count)
-        guard let best = counts.max(by: { ($0.value, $1.key) < ($1.value, $0.key) }) else { return nil }
-        return (best.key, best.value)
-    }
-
     /// Frame numbers stay tied to the scan order even when the grid is
     /// filtered down to the failures.
-    private var displayed: [(number: Int, file: ScannedDNG)] {
+    private func displayed(_ plan: ScanPlan) -> [(number: Int, file: ScannedDNG)] {
         let all = session.results.enumerated().map { (number: $0.offset + 1, file: $0.element) }
         // With no failures left there is no chip to switch the filter back off.
-        guard session.showFailuresOnly, failureCount > 0 else { return all }
+        guard session.showFailuresOnly, plan.failureCount > 0 else { return all }
         return all.filter { session.fixState[$0.file.url]?.isFailure == true }
     }
 
     var body: some View {
+        let plan = ScanPlan(session: session, mappings: mappings)
         VStack(spacing: 0) {
             if session.results.isEmpty && !session.scanning {
                 emptyState
             } else {
-                resultsArea
+                resultsArea(plan)
             }
         }
         .background(Theme.bg)
@@ -128,14 +185,12 @@ struct ScanView: View {
         .safeAreaInset(edge: .bottom) {
             if !session.selection.isEmpty { markBar }
         }
-        .confirmationDialog(fixDialogTitle, isPresented: $confirmFix, titleVisibility: .visible) {
-            Button(scopedTargets.allSatisfy(\.isRefix) && !scopedTargets.isEmpty
-                   ? "Rewrite Metadata Again" : "Rewrite Metadata") {
-                runFix(scopedTargets)
-            }
+        .confirmationDialog(fixDialogTitle(plan), isPresented: $confirmFix,
+                            titleVisibility: .visible) {
+            Button(fixConfirmVerb(scopedTargets(plan))) { runFix(scopedTargets(plan)) }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text(fixDialogMessage)
+            Text(fixDialogMessage(plan))
         }
         .confirmationDialog(
             "Revert the fix on \(pendingRevert?.filename ?? "this frame")?",
@@ -164,7 +219,7 @@ struct ScanView: View {
             AddLensSheet(preselectedCode: code)
         }
         .sheet(item: $codeToMap) { code in
-            MapCodeSheet(code: code, existing: mappingByCode[code])
+            MapCodeSheet(code: code, existing: mappings.first { $0.code == code })
         }
     }
 
@@ -265,7 +320,7 @@ struct ScanView: View {
 
     // MARK: - Results
 
-    private var resultsArea: some View {
+    private func resultsArea(_ plan: ScanPlan) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 18) {
                 if let folder = session.folder {
@@ -279,13 +334,13 @@ struct ScanView: View {
                 if session.scanning {
                     ProgressView().controlSize(.small)
                 } else {
-                    statsAndActions
+                    statsAndActions(plan)
                 }
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
 
-            if !session.scanning, let top = topUnclaimedCode {
+            if !session.scanning, let top = plan.topUnclaimedCode {
                 unclaimedBanner(top)
             }
 
@@ -293,20 +348,20 @@ struct ScanView: View {
 
             switch session.viewMode {
             case .sheet:
-                ContactSheet(frames: displayed,
-                             resolve: resolve,
+                ContactSheet(frames: displayed(plan),
+                             resolve: plan.resolution(for:),
                              fixInfo: { session.fixState[$0.url] },
-                             refixLens: refixLens,
+                             refixLens: plan.refixLens(for:),
                              isSelected: { session.selection.contains($0.url) },
                              onTap: { toggleMark($0) },
                              onAssign: { assignMenu(for: [$0.url]) },
                              onRevert: { if !session.busyNow { pendingRevert = $0 } },
                              onMapCode: { codeToMap = $0 })
             case .list:
-                List(displayed, id: \.file.id) { frame in
-                    ScanRow(file: frame.file, resolution: resolve(frame.file),
+                List(displayed(plan), id: \.file.id) { frame in
+                    ScanRow(file: frame.file, resolution: plan.resolution(for: frame.file),
                             fix: session.fixState[frame.file.url],
-                            refixLens: refixLens(frame.file))
+                            refixLens: plan.refixLens(for: frame.file))
                         .listRowSeparatorTint(Theme.panelEdge)
                         .contextMenu {
                             assignMenu(for: [frame.file.url])
@@ -323,19 +378,18 @@ struct ScanView: View {
     }
 
     @ViewBuilder
-    private var statsAndActions: some View {
+    private func statsAndActions(_ plan: ScanPlan) -> some View {
         stat("\(session.results.count)", "frames")
-        stat("\(session.results.filter { $0.matchedCode != nil }.count)", "coded")
-        stat("\(session.results.filter { resolve($0).lens != nil }.count)", "mapped")
-        let fixedCount = session.fixState.values.filter(\.isFixed).count
-        if fixedCount > 0 {
-            stat("\(fixedCount)", "fixed", color: Theme.ok)
+        stat("\(plan.codedCount)", "coded")
+        stat("\(plan.mappedCount)", "mapped")
+        if plan.fixedCount > 0 {
+            stat("\(plan.fixedCount)", "fixed", color: Theme.ok)
         }
         if session.unreadableCount > 0 {
             stat("\(session.unreadableCount)", "unreadable", color: Theme.rebate)
                 .help("Found but not readable — check System Settings → Privacy & Security")
         }
-        if failureCount > 0 { failureChip }
+        if plan.failureCount > 0 { failureChip(plan.failureCount) }
         if let summary = session.lastRunSummary, !session.busyNow {
             Text(summary)
                 .font(.system(size: 11))
@@ -345,17 +399,18 @@ struct ScanView: View {
         if session.busyNow {
             busyReadout
         } else {
-            fixButtons
+            fixButtons(plan)
         }
     }
 
-    /// The alarm stat: click to narrow the grid to what went wrong.
-    private var failureChip: some View {
+    /// The alarm stat: click to narrow the grid to what went wrong — and to
+    /// what the Retry button can act on.
+    private func failureChip(_ count: Int) -> some View {
         Button {
             session.showFailuresOnly.toggle()
         } label: {
             HStack(spacing: 5) {
-                Text("\(failureCount)").font(Theme.mono(12)).foregroundStyle(Theme.accent)
+                Text("\(count)").font(Theme.mono(12)).foregroundStyle(Theme.accent)
                 EngravedLabel("failed", color: Theme.accent)
             }
             .padding(.horizontal, 7)
@@ -390,24 +445,26 @@ struct ScanView: View {
     }
 
     @ViewBuilder
-    private var fixButtons: some View {
-        if !markedTargets.isEmpty && !session.selection.isEmpty {
-            Button("Fix \(markedTargets.count) marked") {
+    private func fixButtons(_ plan: ScanPlan) -> some View {
+        let all = allTargets(plan)
+        let marked = markedTargets(plan)
+        if !marked.isEmpty {
+            Button(fixLabel(marked, marked: true)) {
                 fixScope = .marked
                 confirmFix = true
             }
             .buttonStyle(.borderedProminent)
             .tint(Theme.accent)
             .controlSize(.small)
-            if fixTargets.count > markedTargets.count {
-                Button("Fix all \(fixTargets.count)") {
+            if all.count > marked.count {
+                Button("\(verb(all)) all \(all.count)") {
                     fixScope = .all
                     confirmFix = true
                 }
                 .controlSize(.small)
             }
-        } else if !fixTargets.isEmpty {
-            Button("Fix \(fixTargets.count) frame\(fixTargets.count == 1 ? "" : "s")") {
+        } else if !all.isEmpty {
+            Button(fixLabel(all, marked: false)) {
                 fixScope = .all
                 confirmFix = true
             }
@@ -415,6 +472,20 @@ struct ScanView: View {
             .tint(Theme.accent)
             .controlSize(.small)
         }
+    }
+
+    /// "Fix", "Retry" or "Rewrite" — whichever is true of the whole set.
+    private func verb(_ targets: [FixTarget]) -> String {
+        if targets.allSatisfy({ $0.kind == .retry }) { return "Retry" }
+        if targets.allSatisfy({ $0.kind == .refix }) { return "Rewrite" }
+        return "Fix"
+    }
+
+    private func fixLabel(_ targets: [FixTarget], marked: Bool) -> String {
+        let count = targets.count
+        if marked { return "\(verb(targets)) \(count) marked" }
+        if targets.allSatisfy({ $0.kind == .retry }) { return "Retry \(count) failed" }
+        return "\(verb(targets)) \(count) frame\(count == 1 ? "" : "s")"
     }
 
     /// The road out of the "0 mapped" dead end: an unclaimed code with a
@@ -498,24 +569,6 @@ struct ScanView: View {
         }
     }
 
-    private func resolve(_ file: ScannedDNG) -> Resolution {
-        if let manual = session.overrides[file.url] {
-            return Resolution(lens: manual, isManual: true)
-        }
-        // When the camera string can't say which generation it is, the codes the
-        // user mapped say which lens they engraved.
-        guard let lens = file.mappedLens({ mappingByCode[$0]?.lens }) else {
-            return Resolution(lens: nil, isManual: false)
-        }
-        return Resolution(lens: lens, isManual: false)
-    }
-
-    /// The lens a fixed frame has since been re-assigned to, if any — it will
-    /// be rewritten rather than silently ignored.
-    private func refixLens(_ file: ScannedDNG) -> UserLens? {
-        fixTargets.first { $0.file.url == file.url && $0.isRefix }?.lens
-    }
-
     private func toggleMark(_ file: ScannedDNG) {
         session.selection.formSymmetricDifference([file.url])
     }
@@ -527,25 +580,39 @@ struct ScanView: View {
 
     // MARK: - Dialog copy
 
-    private var fixDialogTitle: String {
-        let targets = scopedTargets
-        let refixes = targets.filter(\.isRefix).count
-        if refixes == targets.count && refixes > 0 {
-            return "Rewrite \(refixes) already-fixed frame\(refixes == 1 ? "" : "s")?"
+    private func fixDialogTitle(_ plan: ScanPlan) -> String {
+        let targets = scopedTargets(plan)
+        let count = targets.count
+        guard count > 0 else { return "Nothing to fix" }
+        if targets.allSatisfy({ $0.kind == .retry }) {
+            return "Try \(count) failed frame\(count == 1 ? "" : "s") again?"
         }
-        return "Fix \(targets.count) frame\(targets.count == 1 ? "" : "s")?"
+        if targets.allSatisfy({ $0.kind == .refix }) {
+            return "Rewrite \(count) already-fixed frame\(count == 1 ? "" : "s")?"
+        }
+        return "Fix \(count) frame\(count == 1 ? "" : "s")?"
     }
 
-    private var fixDialogMessage: String {
-        let targets = scopedTargets
+    private func fixConfirmVerb(_ targets: [FixTarget]) -> String {
+        if targets.allSatisfy({ $0.kind == .retry }) && !targets.isEmpty { return "Try Again" }
+        if targets.allSatisfy({ $0.kind == .refix }) && !targets.isEmpty { return "Rewrite Metadata Again" }
+        return "Rewrite Metadata"
+    }
+
+    private func fixDialogMessage(_ plan: ScanPlan) -> String {
+        let targets = scopedTargets(plan)
         var lines: [String] = []
         let byLens = Dictionary(grouping: targets, by: { $0.lens.name })
         for (name, group) in byLens.sorted(by: { $0.key < $1.key }) {
             lines.append("\(name) — \(group.count) frame\(group.count == 1 ? "" : "s")")
         }
-        let refixes = targets.filter(\.isRefix).count
+        let refixes = targets.filter { $0.kind == .refix }.count
         if refixes > 0 && refixes < targets.count {
             lines.append("\(refixes) of them \(refixes == 1 ? "was" : "were") already fixed and will be rewritten with the newly assigned lens.")
+        }
+        let retries = targets.filter { $0.kind == .retry }.count
+        if retries > 0 && retries < targets.count {
+            lines.append("\(retries) of them failed earlier and \(retries == 1 ? "is" : "are") being tried again — a failed write leaves the file untouched.")
         }
         lines.append(keepBak
             ? "Lens metadata is rewritten in place. A one-time .bak copy is kept next to each file, and every fix records an undo journal."
@@ -567,7 +634,8 @@ struct ScanView: View {
         guard !targets.isEmpty, !session.busyNow else { return }
         let work = targets.map { ($0.file.url, $0.lens.lensWrite) }
         let bak = keepBak
-        session.showFailuresOnly = false
+        // The failures filter is left alone: retrying from it drains the list,
+        // and displayed() drops the filter once nothing is failing.
         session.lastRunSummary = nil
         session.busy = .fixing
         session.fixProgress = (0, work.count)
@@ -599,7 +667,8 @@ struct ScanView: View {
                 }
                 session.fixProgress = (index + 1, work.count)
             }
-            finish(summary: summary(verb: "fixed", done: fixed, failed: failed,
+            finish(summary: summary(done: fixed, doneVerb: "fixed",
+                                    problems: failed, problemVerb: "failed",
                                     skipped: stopped ? work.count - fixed - failed : 0))
         }
     }
@@ -626,6 +695,9 @@ struct ScanView: View {
                         try Fixer.revert(file: url)
                         return nil
                     } catch {
+                        guard FileManager.default.fileExists(atPath: url.path) else {
+                            return .revertRefused("This file is missing — moved, renamed, or on a volume that isn't mounted. Put it back (or rescan) and revert again.")
+                        }
                         return .revertRefused(error.localizedDescription)
                     }
                 }.value
@@ -638,7 +710,8 @@ struct ScanView: View {
                 }
                 session.fixProgress = (index + 1, urls.count)
             }
-            finish(summary: summary(verb: "reverted", done: reverted, failed: refused,
+            finish(summary: summary(done: reverted, doneVerb: "reverted",
+                                    problems: refused, problemVerb: "refused",
                                     skipped: stopped ? urls.count - reverted - refused : 0))
         }
     }
@@ -650,10 +723,12 @@ struct ScanView: View {
         session.batchTask = nil
     }
 
-    private func summary(verb: String, done: Int, failed: Int, skipped: Int) -> String {
-        var parts = ["\(done) \(verb)"]
-        if failed > 0 { parts.append("\(failed) failed") }
-        if skipped > 0 { parts.append("\(skipped) stopped") }
+    /// "12 fixed, 1 failed" / "3 reverted, 2 refused" — the batch's own words.
+    private func summary(done: Int, doneVerb: String,
+                         problems: Int, problemVerb: String, skipped: Int) -> String {
+        var parts = ["\(done) \(doneVerb)"]
+        if problems > 0 { parts.append("\(problems) \(problemVerb)") }
+        if skipped > 0 { parts.append("\(skipped) not attempted") }
         return parts.joined(separator: ", ")
     }
 
@@ -897,6 +972,7 @@ private struct FrameCell: View {
             lines.append("right-click to try the revert again")
         case .failed(let message):
             lines.append("fix failed: \(message)")
+            lines.append("the file was left untouched — mark this frame to try again")
         case nil:
             break
         }
