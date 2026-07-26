@@ -754,4 +754,54 @@ final class FixerTests: XCTestCase {
         try fixer.revert(file: file)
         XCTAssertEqual(try Data(contentsOf: file), original)
     }
+
+    // MARK: - The scan settles (runs only when UNCODED_TEST_DNG points at a DNG)
+
+    /// A fix has to end. The scan plan puts an already-fixed frame back in the
+    /// fix set whenever `differs` says the write would change something, so a
+    /// write that cannot reproduce its own result means a frame that is fixed,
+    /// shows a RE-FIX row anyway, and stacks another journal on every run.
+    ///
+    /// Against a real M11 frame — a real 2 KB camera XMP packet, a real EXIF
+    /// IFD — and through Fixer, which fills in a missing profile digest of its
+    /// own accord and so can write something the lens row never said.
+    func testFixingARealFrameTwiceFindsNothingToDoTheSecondTime() throws {
+        guard let source = ProcessInfo.processInfo.environment["UNCODED_TEST_DNG"],
+              !source.isEmpty
+        else { throw XCTSkip("set UNCODED_TEST_DNG to a real DNG to run this") }
+
+        let profiled = LensWrite(
+            lensMake: "Voigtlander", lensModel: "Voigtlander VM 35mm f/2 Ultron Aspherical",
+            focalMM: 35, apertureF: 2,
+            profileName: "Adobe (Voigtlander VM 35mm f/2 Ultron Aspherical)",
+            profileFilename: "Leica Camera AG (Voigtlander VM 35mm f2 Ultron Aspherical) - RAW.lcp",
+            profileDigest: "03CBD374CCB89A292AD832BB830E440F")
+        // A hand-typed lens: no crs:LensProfile* at all, so the name and the
+        // numbers are the whole of what a re-fix would have to notice.
+        let handTyped = LensWrite(lensMake: "MS Optical", lensModel: "MS Optical Sonnetar 50mm f/1.1",
+                                  focalMM: 50, apertureF: 1.1,
+                                  profileName: "", profileFilename: "", profileDigest: "")
+
+        for lens in [profiled, handTyped] {
+            let file = tempDir.appendingPathComponent("\(UUID().uuidString).dng")
+            try FileManager.default.copyItem(at: URL(fileURLWithPath: source), to: file)
+
+            XCTAssertTrue(lens.differs(from: try TIFFReader.read(url: file)),
+                          "\(lens.lensModel): an untouched frame needs the fix")
+            try fixer.fix(file: file, with: lens, keepBak: false)
+
+            let settled = try TIFFReader.read(url: file)
+            XCTAssertFalse(lens.differs(from: settled),
+                           "\(lens.lensModel): the scan would offer to re-fix this frame for ever")
+            XCTAssertEqual(settled.lensModel, lens.lensModel)
+            XCTAssertEqual(settled.auxLens, lens.lensModel)
+            XCTAssertEqual(settled.auxLensInfo, lens.xmpLensInfo)
+            XCTAssertEqual(settled.lensSpec, lens.lensSpecText)
+
+            // And a second fix really is a no-op as far as the metadata goes.
+            try fixer.fix(file: file, with: lens, keepBak: false)
+            XCTAssertEqual(try TIFFReader.read(url: file), settled)
+            XCTAssertFalse(lens.differs(from: try TIFFReader.read(url: file)))
+        }
+    }
 }

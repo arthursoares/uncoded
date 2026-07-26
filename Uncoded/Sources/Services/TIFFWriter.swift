@@ -32,6 +32,24 @@ struct LensWrite: Sendable {
         return "\(f) \(f) \(a) \(a)"
     }
 
+    /// What EXIF LensSpecification will read as once this write lands, in the
+    /// reader's own rendering. Nil when the lens has no usable numbers — then
+    /// the write leaves FocalLength and LensSpecification alone.
+    ///
+    /// Quantized the way `setRationals` quantizes: it stores every value over a
+    /// denominator of 1000, so a lens with a fourth decimal place comes back off
+    /// the grid it went on. Comparing the raw value against the rounded one on
+    /// disk would leave that lens asking to be rewritten for ever.
+    var lensSpecText: String? {
+        guard let focal = focalMM, let aperture = apertureF,
+              focal.isFinite, aperture.isFinite,
+              focal > 0, aperture > 0, focal <= 1_000_000, aperture <= 1_000_000
+        else { return nil }
+        let stored = { (v: Double) in (v * 1000).rounded() / 1000 }
+        return TIFFReader.lensSpecText(minFocal: stored(focal), maxFocal: stored(focal),
+                                       aperture: stored(aperture))
+    }
+
     /// The shortest exact rational for a lens number: 35 → "35/1", 1.8 → "18/10".
     /// Unreduced denominators are valid XMP and are what Lightroom writes.
     private static func rational(_ v: Double) -> String? {
@@ -45,6 +63,52 @@ struct LensWrite: Sendable {
             denominator *= 10
         }
         return nil
+    }
+}
+
+extension LensWrite {
+    /// Whether writing this lens would change anything the file already says.
+    ///
+    /// Comparing the claimed lens *name* is not enough to spot the case this
+    /// exists for: a frame fixed by v0.1.x claims exactly the right name beside
+    /// an empty `crs:LensProfileDigest`, and rewriting it is the only repair.
+    ///
+    /// Only the fields this write actually sets are compared, and only where it
+    /// would set them to something: `xmpProperties` skips empty values and
+    /// writes no `crs:LensProfile*` at all for a lens with no profile, so an
+    /// empty value here changes nothing on disk and must not read as a
+    /// difference — otherwise a hand-typed lens would ask to be rewritten
+    /// forever.
+    ///
+    /// Which is also why an orphan `crs:LensProfileSetup="Custom"` — what
+    /// v0.1.1 left on a no-profile lens, a profile reference naming nothing —
+    /// is *not* counted as a difference, however much it deserves to be: the
+    /// writer only ever sets properties, so a fix cannot clear it, and flagging
+    /// a state no fix can reach is a frame that asks to be rewritten for ever.
+    /// Repairing those files needs the writer to learn to remove a property.
+    func differs(from metadata: TIFFReader.LensMetadata) -> Bool {
+        func matches(_ value: String, _ current: String?) -> Bool {
+            let value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty else { return true }
+            return value == (current ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard matches(lensMake, metadata.lensMake),
+              matches(lensModel, metadata.lensModel),
+              // aux:Lens gets the model too; a half-landed fix leaves the two
+              // disagreeing, and that is a frame worth rewriting.
+              matches(lensModel, metadata.auxLens),
+              // The focal length and maximum aperture, in EXIF and in the XMP
+              // copy Lightroom actually shows. v0.1.1 wrote only the EXIF one,
+              // leaving aux:LensInfo describing the borrowed Leica lens at its
+              // wrong maximum aperture — for a lens with no Adobe profile that
+              // is the whole of what a repair has to put right.
+              matches(lensSpecText ?? "", metadata.lensSpec),
+              matches(xmpLensInfo ?? "", metadata.auxLensInfo)
+        else { return true }
+        guard hasProfile else { return false }
+        return !(matches(profileName, metadata.profileName)
+            && matches(profileFilename, metadata.profileFilename)
+            && matches(profileDigest, metadata.profileDigest))
     }
 }
 

@@ -44,9 +44,23 @@ struct ScanView: View {
         private(set) var mappedCount = 0
         private(set) var fixedCount = 0
         private(set) var failureCount = 0
-        private(set) var unclaimedCodes: [String: Int] = [:]
+        /// Frames the scan can't route, grouped by the codes they wear — one
+        /// entry per code normally, and one per pair when the camera's lens
+        /// name fits more than one code.
+        private(set) var unclaimedCodes: [[String]: UnclaimedGroup] = [:]
 
-        init(session: ScanSession, mappings: [CodeMapping]) {
+        /// One such group, and why it is stuck. `contested` means the codes
+        /// *are* claimed — by two different lenses — so mapping a code is no
+        /// way out of it; only the user can say which lens shot these frames.
+        struct UnclaimedGroup {
+            var codes: [String] = []
+            var frames: [URL] = []
+            var contested = false
+
+            var count: Int { frames.count }
+        }
+
+        init(session: ScanSession, mappings: [CodeMapping], lenses: [UserLens]) {
             // The lens each mapped code points at. First row wins per code.
             var lensByCode: [String: UserLens] = [:]
             var seen = Set<String>()
@@ -55,27 +69,49 @@ struct ScanView: View {
             }
 
             for file in session.results {
+                // A file whose name matches no code at all may still name one
+                // of the user's own lenses — Uncoded's own output, read back.
+                // Only frames with nothing for the code table to say are asked:
+                // where there are candidates, they and the mappings decide, and
+                // an ambiguity is an ambiguity.
+                let claimed = file.codeCandidates.isEmpty
+                    ? UserLens.claiming(file.meta, in: lenses) : nil
+
                 let resolution: Resolution
                 if let manual = session.overrides[file.url] {
-                    resolution = Resolution(lens: manual, isManual: true)
+                    resolution = Resolution(lens: manual, isManual: true,
+                                            isClaimed: claimed != nil)
                 } else if let lens = file.mappedLens({ lensByCode[$0] }) {
                     // When the camera string can't say which generation it is,
                     // the codes the user mapped say which lens they engraved.
                     resolution = Resolution(lens: lens, isManual: false)
+                } else if let claimed {
+                    // Already assigned, by the file itself. Not an override and
+                    // not a coded frame — just one Uncoded has been here before.
+                    resolution = Resolution(lens: claimed, isManual: false, isClaimed: true)
                 } else {
                     resolution = Resolution(lens: nil, isManual: false)
                 }
                 resolutions[file.url] = resolution
 
                 let state = session.fixState[file.url]
-                if file.matchedCode != nil { codedCount += 1 }
+                // A frame whose name fits two codes wears a code either way —
+                // which one is the open question, not whether.
+                if !file.codeCandidates.isEmpty { codedCount += 1 }
                 if resolution.lens != nil { mappedCount += 1 }
                 if state?.isFixed == true { fixedCount += 1 }
                 if state?.isFailure == true { failureCount += 1 }
-                if let code = file.matchedCode?.code, resolution.lens == nil, state == nil {
-                    unclaimedCodes[code, default: 0] += 1
+                if resolution.lens == nil, state == nil, !file.codeCandidates.isEmpty {
+                    let codes = file.codeCandidates.map(\.code)
+                    // Reaching here with any candidate mapped means two of them
+                    // are mapped to *different* lenses — one mapped candidate
+                    // would have resolved the frame in the first place.
+                    var group = unclaimedCodes[codes] ?? UnclaimedGroup(
+                        codes: codes, contested: codes.contains { lensByCode[$0] != nil })
+                    group.frames.append(file.url)
+                    unclaimedCodes[codes] = group
                 }
-                if let target = Self.target(file: file, lens: resolution.lens, state: state) {
+                if let target = Self.target(file: file, resolution: resolution, state: state) {
                     targets.append(target)
                     targetByURL[file.url] = target
                 }
@@ -83,22 +119,25 @@ struct ScanView: View {
         }
 
         /// Frames that resolve to a lens and still need a write: never fixed,
-        /// a failed write worth retrying (nothing was committed), or a fixed
-        /// frame whose lens no longer matches what the file claims.
-        private static func target(file: ScannedDNG, lens: UserLens?,
+        /// a failed write worth retrying (nothing was committed), or an
+        /// already-fixed frame the current fix would not write the same way.
+        ///
+        /// "Already fixed" is a seal *or* a file that claims one of the user's
+        /// lenses under its own steam: a frame fixed by v0.1.x whose journal is
+        /// long gone reads as untouched, and rewriting it is how its empty
+        /// profile digest gets repaired.
+        private static func target(file: ScannedDNG, resolution: Resolution,
                                    state: FrameFix?) -> FixTarget? {
-            guard let lens else { return nil }
+            guard let lens = resolution.lens else { return nil }
+            let alreadyWritten = state?.isFixed == true || resolution.isClaimed
             switch state {
-            case nil:
-                return FixTarget(file: file, lens: lens, kind: .first)
             case .failed:
                 return FixTarget(file: file, lens: lens, kind: .retry)
-            case .fixed, .revertRefused:
-                // The reader trims what it reads, so compare trimmed.
-                let claimed = file.claimedLens?.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard claimed != lens.name.trimmingCharacters(in: .whitespacesAndNewlines) else {
-                    return nil
-                }
+            case nil where !alreadyWritten:
+                return FixTarget(file: file, lens: lens, kind: .first)
+            default:
+                // The name alone can't see a v0.1.x fix with an empty digest.
+                guard lens.lensWrite.differs(from: file.meta) else { return nil }
                 return FixTarget(file: file, lens: lens, kind: .refix)
             }
         }
@@ -113,11 +152,11 @@ struct ScanView: View {
             return target.lens
         }
 
-        /// The most frequent unclaimed code — the one to suggest claiming first.
-        var topUnclaimedCode: (code: String, count: Int)? {
-            guard let best = unclaimedCodes.max(by: { ($0.value, $1.key) < ($1.value, $0.key) })
-            else { return nil }
-            return (best.key, best.value)
+        /// The biggest group of stuck frames — the one worth unsticking first.
+        var topUnclaimedCode: UnclaimedGroup? {
+            unclaimedCodes.values.max {
+                ($0.count, $1.codes.joined()) < ($1.count, $0.codes.joined())
+            }
         }
     }
 
@@ -153,7 +192,7 @@ struct ScanView: View {
     }
 
     var body: some View {
-        let plan = ScanPlan(session: session, mappings: mappings)
+        let plan = ScanPlan(session: session, mappings: mappings, lenses: lenses)
         VStack(spacing: 0) {
             if session.results.isEmpty && !session.scanning {
                 emptyState
@@ -358,6 +397,7 @@ struct ScanView: View {
                              resolve: plan.resolution(for:),
                              fixInfo: { session.fixState[$0.url] },
                              refixLens: plan.refixLens(for:),
+                             renamedFrom: { session.renamedFrom[$0.url] },
                              isSelected: { session.selection.contains($0.url) },
                              onTap: { toggleMark($0) },
                              onAssign: { assignMenu(for: [$0.url]) },
@@ -498,27 +538,80 @@ struct ScanView: View {
         return "\(verb(targets)) \(count) frame\(count == 1 ? "" : "s")"
     }
 
-    /// The road out of the "0 mapped" dead end: an unclaimed code with a
-    /// direct route to claiming it.
-    private func unclaimedBanner(_ top: (code: String, count: Int)) -> some View {
+    /// The road out of the "0 mapped" dead end: stuck frames, and the way out
+    /// of the particular way they are stuck. An unclaimed code gets the route
+    /// to claiming it; a lens name that fits several codes gets all of them,
+    /// since only the user knows which one is engraved. And codes that are
+    /// *already* claimed, by two different lenses, get neither — mapping is
+    /// not the question there, so the banner marks the frames instead and
+    /// hands them to the Assign Lens menu that appears for a marked set.
+    private func unclaimedBanner(_ group: ScanPlan.UnclaimedGroup) -> some View {
         HStack(spacing: 10) {
-            BitPatternView(code: top.code, dotSize: 7)
-            Text("\(top.count) frame\(top.count == 1 ? "" : "s") wear\(top.count == 1 ? "s" : "") code \(top.code) — not claimed by any of your lenses yet")
+            HStack(spacing: 8) {
+                ForEach(Array(group.codes.enumerated()), id: \.element) { index, code in
+                    if index > 0 { EngravedLabel("or", color: Theme.rebate.opacity(0.7)) }
+                    BitPatternView(code: code, dotSize: 7)
+                }
+            }
+            Text(unclaimedText(group))
                 .font(.system(size: 11))
                 .foregroundStyle(Theme.rebate)
             Spacer()
-            if !lenses.isEmpty {
-                Button("Map to a Lens…") { codeToMap = top.code }
-                    .controlSize(.small)
-            }
-            Button("Add Lens…") { addLensCode = top.code }
+            if group.contested {
+                Button(group.count == 1 ? "Mark This Frame" : "Mark These \(group.count) Frames") {
+                    session.selection = Set(group.frames)
+                }
                 .controlSize(.small)
                 .buttonStyle(.borderedProminent)
                 .tint(Theme.accent)
+                .disabled(session.busyNow)
+            } else if let code = group.codes.first, group.codes.count == 1 {
+                if !lenses.isEmpty {
+                    Button("Map to a Lens…") { codeToMap = code }
+                        .controlSize(.small)
+                }
+                Button("Add Lens…") { addLensCode = code }
+                    .controlSize(.small)
+                    .buttonStyle(.borderedProminent)
+                    .tint(Theme.accent)
+            } else {
+                if !lenses.isEmpty {
+                    Menu("Map a Code…") {
+                        ForEach(group.codes, id: \.self) { code in
+                            Button("Code \(code)…") { codeToMap = code }
+                        }
+                    }
+                    .menuStyle(.borderedButton)
+                    .controlSize(.small)
+                    .fixedSize()
+                }
+                Menu("Add Lens…") {
+                    ForEach(group.codes, id: \.self) { code in
+                        Button("With code \(code)…") { addLensCode = code }
+                    }
+                }
+                .menuStyle(.borderedButton)
+                .controlSize(.small)
+                .fixedSize()
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
         .background(Theme.rebate.opacity(0.08))
+    }
+
+    private func unclaimedText(_ group: ScanPlan.UnclaimedGroup) -> String {
+        let count = group.count
+        let subject = "\(count) frame\(count == 1 ? "" : "s") wear\(count == 1 ? "s" : "")"
+        let codes = group.codes.joined(separator: " or ")
+        if group.contested {
+            return "\(subject) code \(codes) — \(group.codes.count == 2 ? "both" : "those") codes are mapped, to different lenses, so Uncoded won't pick between them; mark \(count == 1 ? "it" : "them") and assign the lens you actually used"
+        }
+        guard group.codes.count > 1 else {
+            return "\(subject) code \(codes) — not claimed by any of your lenses yet"
+        }
+        let fits = group.codes.count == 2 ? "either" : "any of them"
+        return "\(subject) code \(codes) — the camera's lens name fits \(fits), so Uncoded won't guess; map the one you engraved"
     }
 
     /// Grease-pencil action bar for the marked frames.
@@ -618,7 +711,10 @@ struct ScanView: View {
         }
         let refixes = targets.filter { $0.kind == .refix }.count
         if refixes > 0 && refixes < targets.count {
-            lines.append("\(refixes) of them \(refixes == 1 ? "was" : "were") already fixed and will be rewritten with the newly assigned lens.")
+            // Re-assigned by hand, or fixed by a version that wrote less than
+            // this one does — either way, the file no longer says what a fix
+            // would say.
+            lines.append("\(refixes) of them \(refixes == 1 ? "was" : "were") already fixed and will be rewritten: what Uncoded writes now differs from what the file\(refixes == 1 ? "" : "s") already \(refixes == 1 ? "carries" : "carry").")
         }
         let retries = targets.filter { $0.kind == .retry }.count
         if retries > 0 && retries < targets.count {
@@ -651,6 +747,7 @@ struct ScanView: View {
         session.fixProgress = (0, work.count)
         session.batchTask = Task {
             var fixed = 0
+            var warned = 0
             var failed = 0
             var stopped = false
             for (index, item) in work.enumerated() {
@@ -662,15 +759,18 @@ struct ScanView: View {
                 let (url, write) = item
                 let outcome: FrameFix = await Task.detached(priority: .userInitiated) {
                     do {
-                        try Fixer.fix(file: url, with: write, keepBak: bak)
-                        return .fixed
+                        let result = try Fixer.fix(file: url, with: write, keepBak: bak)
+                        return .fixed(warnings: result.warnings)
                     } catch {
                         return .failed(error.localizedDescription)
                     }
                 }.value
                 session.fixState[url] = outcome
-                if case .fixed = outcome {
+                if case .fixed(let warnings) = outcome {
                     fixed += 1
+                    // The write landed; the warning is about the .bak beside
+                    // it. Counted apart so the summary doesn't imply a failure.
+                    if !warnings.isEmpty { warned += 1 }
                     await refresh(url)
                 } else {
                     failed += 1
@@ -678,6 +778,7 @@ struct ScanView: View {
                 session.fixProgress = (index + 1, work.count)
             }
             finish(summary: summary(done: fixed, doneVerb: "fixed",
+                                    doneNote: warned > 0 ? "\(warned) with warnings" : nil,
                                     problems: failed, problemVerb: "failed",
                                     skipped: stopped ? work.count - fixed - failed : 0))
         }
@@ -733,10 +834,11 @@ struct ScanView: View {
         session.batchTask = nil
     }
 
-    /// "12 fixed, 1 failed" / "3 reverted, 2 refused" — the batch's own words.
-    private func summary(done: Int, doneVerb: String,
+    /// "12 fixed (2 with warnings), 1 failed" / "3 reverted, 2 refused" — the
+    /// batch's own words.
+    private func summary(done: Int, doneVerb: String, doneNote: String? = nil,
                          problems: Int, problemVerb: String, skipped: Int) -> String {
-        var parts = ["\(done) \(doneVerb)"]
+        var parts = ["\(done) \(doneVerb)" + (doneNote.map { " (\($0))" } ?? "")]
         if problems > 0 { parts.append("\(problems) \(problemVerb)") }
         if skipped > 0 { parts.append("\(skipped) not attempted") }
         return parts.joined(separator: ", ")
@@ -761,14 +863,19 @@ struct ScanView: View {
         session.selection = []
         session.overrides = [:]
         session.fixState = [:]
+        session.renamedFrom = [:]
         session.unreadableCount = 0
         session.skippedSubfolders = 0
         session.folderReadable = true
         session.showFailuresOnly = false
         session.lastRunSummary = nil
         Task {
-            let (outcome, journaled) = await Task.detached(priority: .userInitiated) {
-                (DNGScanner.scan(folder: url), JournalStore.fixedPaths())
+            let (outcome, seals) = await Task.detached(priority: .userInitiated) {
+                let outcome = DNGScanner.scan(folder: url)
+                // By content, not just by path: a fixed frame Lightroom renamed
+                // on import has no journal at its new name, and matching the
+                // bytes is what keeps its undo reachable.
+                return (outcome, JournalStore.sealedURLs(in: outcome.files.map(\.url)))
             }.value
             session.results = outcome.files
             session.unreadableCount = outcome.unreadable
@@ -776,9 +883,10 @@ struct ScanView: View {
             session.folderReadable = outcome.folderReadable
             // Files with a persisted journal were fixed in an earlier session —
             // restore their FIXED seals so revert stays reachable.
-            for file in outcome.files where journaled.contains(file.url.path) {
-                session.fixState[file.url] = .fixed
+            for file in outcome.files where seals.sealed.contains(file.url) {
+                session.fixState[file.url] = .fixed(warnings: [])
             }
+            session.renamedFrom = seals.renamedFrom
             session.scanning = false
         }
     }
@@ -794,6 +902,7 @@ private struct ContactSheet<AssignMenu: View>: View {
     let resolve: (ScannedDNG) -> Resolution
     let fixInfo: (ScannedDNG) -> FrameFix?
     let refixLens: (ScannedDNG) -> UserLens?
+    let renamedFrom: (ScannedDNG) -> String?
     let isSelected: (ScannedDNG) -> Bool
     let onTap: (ScannedDNG) -> Void
     @ViewBuilder let onAssign: (ScannedDNG) -> AssignMenu
@@ -811,6 +920,7 @@ private struct ContactSheet<AssignMenu: View>: View {
                               resolution: resolve(file),
                               fix: fixInfo(file),
                               refixLens: refixLens(file),
+                              renamedFrom: renamedFrom(file),
                               selected: isSelected(file))
                         .onTapGesture { onTap(file) }
                         .contextMenu {
@@ -818,9 +928,15 @@ private struct ContactSheet<AssignMenu: View>: View {
                             if fixInfo(file)?.isFixed == true {
                                 Divider()
                                 Button("Revert Fix…") { onRevert(file) }
-                            } else if let code = file.matchedCode?.code, resolve(file).lens == nil {
+                            } else if resolve(file).lens == nil, !file.codeCandidates.isEmpty {
+                                // Every candidate, never a guess: two codes fit
+                                // the name and only the lens itself knows which.
                                 Divider()
-                                Button("Map Code \(code) to a Lens…") { onMapCode(code) }
+                                ForEach(file.codeCandidates, id: \.code) { candidate in
+                                    Button("Map Code \(candidate.code) to a Lens…") {
+                                        onMapCode(candidate.code)
+                                    }
+                                }
                             }
                         }
                 }
@@ -837,9 +953,12 @@ private struct FrameCell: View {
     let resolution: Resolution
     let fix: FrameFix?
     let refixLens: UserLens?
+    let renamedFrom: String?
     let selected: Bool
 
     @State private var image: NSImage?
+
+    private var warnings: [String] { fix?.warnings ?? [] }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -908,6 +1027,20 @@ private struct FrameCell: View {
                         .foregroundStyle(Theme.ok)
                         .lineLimit(1)
                     EngravedLabel("fixed", color: Theme.ok)
+                    // The write landed; something about the backup beside it
+                    // did not. A tick, not an alarm.
+                    if !warnings.isEmpty {
+                        Image(systemName: "exclamationmark.circle.fill")
+                            .font(.system(size: 8))
+                            .foregroundStyle(Theme.rebate)
+                    }
+                }
+                if !warnings.isEmpty {
+                    Text(warnings.joined(separator: "\n"))
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.rebate)
+                        .lineLimit(4)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 if case .revertRefused(let message) = fix {
                     EngravedLabel("revert refused", color: Theme.rebate)
@@ -917,18 +1050,7 @@ private struct FrameCell: View {
                         .lineLimit(4)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                if let refixLens {
-                    HStack(spacing: 4) {
-                        Image(systemName: "arrow.triangle.2.circlepath")
-                            .font(.system(size: 8))
-                            .foregroundStyle(Theme.rebate)
-                        Text(refixLens.name)
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundStyle(Theme.rebate)
-                            .lineLimit(1)
-                        EngravedLabel("re-fix", color: Theme.rebate)
-                    }
-                }
+                refixRow
             case .failed(let message):
                 HStack(spacing: 4) {
                     Image(systemName: "exclamationmark.triangle.fill")
@@ -958,6 +1080,14 @@ private struct FrameCell: View {
                         Text("code not mapped")
                             .font(.system(size: 9))
                             .foregroundStyle(Theme.faint)
+                    } else if file.codeCandidates.count > 1 {
+                        // Coded, but the name fits several codes and the file
+                        // records none of them. Say that much and no more —
+                        // whether those codes are mapped is the banner's story,
+                        // and both endings leave this frame unrouted.
+                        Text("\(file.codeCandidates.count) possible codes — Uncoded won't guess")
+                            .font(.system(size: 9))
+                            .foregroundStyle(Theme.faint)
                     } else {
                         Text(file.claimedLens ?? "no lens metadata")
                             .font(.system(size: 9))
@@ -965,6 +1095,26 @@ private struct FrameCell: View {
                             .lineLimit(1)
                     }
                 }
+                // A frame Uncoded fixed before its journal was lost has no
+                // seal, so its rewrite has to announce itself here.
+                refixRow
+            }
+        }
+    }
+
+    /// The lens a frame is about to be rewritten to.
+    @ViewBuilder
+    private var refixRow: some View {
+        if let refixLens {
+            HStack(spacing: 4) {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .font(.system(size: 8))
+                    .foregroundStyle(Theme.rebate)
+                Text(refixLens.name)
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(Theme.rebate)
+                    .lineLimit(1)
+                EngravedLabel("re-fix", color: Theme.rebate)
             }
         }
     }
@@ -972,13 +1122,26 @@ private struct FrameCell: View {
     private var helpText: String {
         var lines = [file.filename]
         if let claimed = file.claimedLens { lines.append("claims: \(claimed)") }
-        if let code = file.matchedCode { lines.append("code \(code.code) — \(code.lensName)") }
+        if let code = file.matchedCode {
+            lines.append("code \(code.code) — \(code.lensName)")
+        } else if file.codeCandidates.count > 1 {
+            for candidate in file.codeCandidates {
+                lines.append("code \(candidate.code) — \(candidate.lensName)")
+            }
+            lines.append("""
+            the camera's lens name fits all of these and the file records none \
+            of them, so Uncoded won't guess — right-click to map the code you \
+            actually engraved, or to assign this frame its lens by hand.
+            """)
+        }
         if let lens = resolution.lens {
             lines.append("actually: \(lens.name)\(resolution.isManual ? " (manual)" : "")")
         }
         switch fix {
-        case .fixed:
-            lines.append("fixed — right-click to revert")
+        case .fixed(let warnings):
+            lines.append(renamedFrom.map { "fixed as \($0), renamed since — right-click to revert" }
+                ?? "fixed — right-click to revert")
+            lines.append(contentsOf: warnings)
         case .revertRefused(let message):
             lines.append("still fixed; revert refused: \(message)")
             lines.append("right-click to try the revert again")
@@ -989,7 +1152,9 @@ private struct FrameCell: View {
             break
         }
         if let refixLens {
-            lines.append("re-assigned to \(refixLens.name) — Fix rewrites this frame")
+            lines.append(resolution.isClaimed && !resolution.isManual
+                ? "already carries \(refixLens.name), but not everything this version writes — Fix rewrites this frame"
+                : "re-assigned to \(refixLens.name) — Fix rewrites this frame")
         }
         return lines.joined(separator: "\n")
     }
@@ -1002,6 +1167,25 @@ private struct ScanRow: View {
     let resolution: Resolution
     let fix: FrameFix?
     let refixLens: UserLens?
+
+    private var warnings: [String] { fix?.warnings ?? [] }
+
+    /// The lens a frame is about to be rewritten to.
+    @ViewBuilder
+    private var refixRow: some View {
+        if let refixLens {
+            HStack(spacing: 5) {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .font(.system(size: 8))
+                    .foregroundStyle(Theme.rebate)
+                Text(refixLens.name)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Theme.rebate)
+                    .lineLimit(1)
+                EngravedLabel("re-fix", color: Theme.rebate)
+            }
+        }
+    }
 
     var body: some View {
         HStack(spacing: 14) {
@@ -1030,6 +1214,16 @@ private struct ScanRow: View {
                             .font(.system(size: 8))
                             .foregroundStyle(Theme.ok)
                         EngravedLabel("fixed", color: Theme.ok)
+                        // The write landed; the backup beside it is the worry.
+                        if !warnings.isEmpty {
+                            Image(systemName: "exclamationmark.circle.fill")
+                                .font(.system(size: 8))
+                                .foregroundStyle(Theme.rebate)
+                            Text(warnings.joined(separator: "\n"))
+                                .font(.system(size: 10))
+                                .foregroundStyle(Theme.rebate)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
                     if case .revertRefused(let message) = fix {
                         HStack(spacing: 5) {
@@ -1040,18 +1234,7 @@ private struct ScanRow: View {
                                 .fixedSize(horizontal: false, vertical: true)
                         }
                     }
-                    if let refixLens {
-                        HStack(spacing: 5) {
-                            Image(systemName: "arrow.triangle.2.circlepath")
-                                .font(.system(size: 8))
-                                .foregroundStyle(Theme.rebate)
-                            Text(refixLens.name)
-                                .font(.system(size: 11, weight: .medium))
-                                .foregroundStyle(Theme.rebate)
-                                .lineLimit(1)
-                            EngravedLabel("re-fix", color: Theme.rebate)
-                        }
-                    }
+                    refixRow
                 case .failed(let message):
                     HStack(spacing: 5) {
                         EngravedLabel("failed", color: Theme.accent)
@@ -1078,7 +1261,16 @@ private struct ScanRow: View {
                         Text("code not mapped to one of your lenses")
                             .font(.system(size: 10))
                             .foregroundStyle(Theme.faint)
+                    } else if file.codeCandidates.count > 1 {
+                        // The name fits several codes and the file records none
+                        // of them — coded, but not to a code we may pick.
+                        Text("code \(file.codeCandidates.map(\.code).joined(separator: " or ")) — Uncoded won't guess which")
+                            .font(.system(size: 10))
+                            .foregroundStyle(Theme.faint)
                     }
+                    // A frame fixed before its journal was lost has no seal, so
+                    // its rewrite has to announce itself here.
+                    refixRow
                 }
             }
             Spacer()
