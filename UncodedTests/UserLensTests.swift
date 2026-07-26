@@ -85,6 +85,8 @@ final class UserLensTests: XCTestCase {
         meta.lensMake = lens.make
         meta.lensModel = lens.name
         meta.auxLens = lens.name
+        meta.lensSpec = lens.lensWrite.lensSpecText
+        meta.auxLensInfo = lens.lensWrite.xmpLensInfo
         meta.profileName = lens.profileName
         meta.profileFilename = lens.profileFilename
         meta.profileDigest = lens.profileDigest
@@ -129,13 +131,48 @@ final class UserLensTests: XCTestCase {
     func testALensWithNoProfileIgnoresTheProfileFieldsOnDisk() {
         let manual = UserLens(name: "MS Optical Sonnetar 50mm f/1.1", make: "MS Optical",
                               focalLength: "50.0mm", aperture: "f/1.1")
-        var meta = TIFFReader.LensMetadata()
-        meta.lensMake = manual.make
-        meta.lensModel = manual.name
-        meta.auxLens = manual.name
+        var meta = fixedMetadata(manual)
         meta.profileName = "Adobe (something else entirely)"
         meta.profileDigest = "ZZZ"
         XCTAssertFalse(manual.lensWrite.differs(from: meta))
+    }
+
+    /// A no-profile lens has no crs:LensProfile* to repair, so the wrong
+    /// maximum aperture in the XMP twin is the whole of what a re-fix fixes —
+    /// and v0.1.1 wrote only the EXIF copy, leaving this one saying f/2.
+    func testANoProfileLensStillNoticesTheStaleLensInfo() {
+        let manual = UserLens(name: "MS Optical Sonnetar 50mm f/1.1", make: "MS Optical",
+                              focalLength: "50.0mm", aperture: "f/1.1")
+        var v0 = fixedMetadata(manual)
+        v0.auxLensInfo = "50/1 50/1 2/1 2/1" // the borrowed Leica lens's
+        XCTAssertTrue(manual.lensWrite.differs(from: v0),
+                      "this is the copy Lightroom shows")
+
+        // And the EXIF side on its own.
+        var exifOnly = fixedMetadata(manual)
+        exifOnly.lensSpec = "50mm f/2"
+        XCTAssertTrue(manual.lensWrite.differs(from: exifOnly))
+    }
+
+    /// A lens whose numbers can't be written is not a lens whose numbers
+    /// disagree: with nothing to put in either field the write leaves both
+    /// alone, so whatever they hold is none of its business.
+    func testALensWithNoUsableNumbersLeavesTheSpecFieldsAlone() {
+        let odd = UserLens(name: "Mystery", make: "?", focalLength: "", aperture: "")
+        XCTAssertNil(odd.lensWrite.lensSpecText)
+        XCTAssertNil(odd.lensWrite.xmpLensInfo)
+        var meta = fixedMetadata(odd)
+        meta.lensSpec = "50mm f/2"
+        meta.auxLensInfo = "50/1 50/1 2/1 2/1"
+        XCTAssertFalse(odd.lensWrite.differs(from: meta))
+    }
+
+    /// The writer stores every rational over 1000, so the comparison has to ask
+    /// what lands on disk, not what was typed — or a fourth decimal place would
+    /// leave the frame asking to be rewritten for ever.
+    func testTheSpecComparisonUsesTheValueTheWriterWouldStore() {
+        let odd = UserLens(name: "Odd", make: "?", focalLength: "35.0mm", aperture: "f/1.0625")
+        XCTAssertEqual(odd.lensWrite.lensSpecText, "35mm f/1.063")
     }
 
     func testTrailingWhitespaceIsNotADifference() {

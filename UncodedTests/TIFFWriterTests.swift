@@ -936,6 +936,23 @@ final class TIFFWriterTests: XCTestCase {
         }
     }
 
+    /// The same guard for a hand-typed lens, which writes no crs:LensProfile*
+    /// at all: the only fields it sets are the name and the numbers, and those
+    /// have to survive a round trip just as exactly.
+    func testANoProfileWriteDoesNotDifferFromItsOwnResult() throws {
+        var manual = voigtlander
+        manual.profileName = ""
+        manual.profileFilename = ""
+        manual.profileDigest = ""
+        XCTAssertFalse(manual.hasProfile)
+
+        let url = try writeTemp(makeTIFF(xmp: sampleXMP).data)
+        XCTAssertTrue(manual.differs(from: try TIFFReader.read(url: url)))
+        _ = try TIFFWriter.apply(manual, to: url)
+        XCTAssertFalse(manual.differs(from: try TIFFReader.read(url: url)),
+                       "re-fixing this frame would change nothing")
+    }
+
     /// How a frame fixed by v0.1.x becomes repairable: same name on the file,
     /// but the digest the lens now has never made it in.
     func testAFixWithNoDigestStillDiffersOnceTheDigestIsKnown() throws {

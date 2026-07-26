@@ -24,6 +24,7 @@ struct TIFFReader {
         var lensModel: String?
         var lensSpec: String? // rendered from EXIF LensSpecification, e.g. "50mm f/1.2"
         var auxLens: String? // XMP aux:Lens
+        var auxLensInfo: String? // XMP aux:LensInfo, e.g. "35/1 35/1 2/1 2/1"
         var profileName: String? // XMP crs:LensProfileName
         var profileFilename: String? // XMP crs:LensProfileFilename
         var profileDigest: String? // XMP crs:LensProfileDigest
@@ -83,6 +84,9 @@ struct TIFFReader {
         if let xmpEntry = ifd0[Tag.xmp], let xmpData = valueData(xmpEntry),
            let xmp = String(data: xmpData, encoding: .utf8) {
             meta.auxLens = Self.xmpValue(xmp, property: "aux:Lens")
+            // The copy Lightroom shows. The camera's own describes the borrowed
+            // Leica lens, usually at the wrong maximum aperture.
+            meta.auxLensInfo = Self.xmpValue(xmp, property: "aux:LensInfo")
             meta.profileName = Self.xmpValue(xmp, property: "crs:LensProfileName")
             meta.profileFilename = Self.xmpValue(xmp, property: "crs:LensProfileFilename")
             meta.profileDigest = Self.xmpValue(xmp, property: "crs:LensProfileDigest")
@@ -165,11 +169,18 @@ struct TIFFReader {
             else { return nil }
             values.append(Double(num) / Double(den))
         }
-        let focal = values[0] == values[1] ? fmt(values[0]) : "\(fmt(values[0]))-\(fmt(values[1]))"
-        return "\(focal)mm f/\(fmt(values[2]))"
+        return Self.lensSpecText(minFocal: values[0], maxFocal: values[1], aperture: values[2])
     }
 
-    private func fmt(_ v: Double) -> String {
+    /// The rendering `LensMetadata.lensSpec` uses, exposed so a `LensWrite` can
+    /// say what this field would read as once the write lands — without a
+    /// second copy of the format to drift out of step with this one.
+    static func lensSpecText(minFocal: Double, maxFocal: Double, aperture: Double) -> String {
+        let focal = minFocal == maxFocal ? fmt(minFocal) : "\(fmt(minFocal))-\(fmt(maxFocal))"
+        return "\(focal)mm f/\(fmt(aperture))"
+    }
+
+    private static func fmt(_ v: Double) -> String {
         v == v.rounded() ? String(Int(v)) : String(v)
     }
 
