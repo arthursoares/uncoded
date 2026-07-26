@@ -83,18 +83,25 @@ enum LCPIndex {
     }
 }
 
-/// Repairs `UserLens` rows saved before Uncoded knew how to compute a profile
-/// digest. v0.1.x left `profileDigest` empty on every lens, so every fix it made
-/// wrote `crs:LensProfileDigest=""` — a profile reference Lightroom cannot
-/// resolve. The .lcp filename was recorded though, and the digest is derived
-/// from the file, so the rows can be repaired without asking the user anything.
+/// Keeps `UserLens.profileDigest` in step with the .lcp files actually installed.
+///
+/// v0.1.x left the digest empty on every lens, so every fix it made wrote
+/// `crs:LensProfileDigest=""` — a profile reference Lightroom cannot resolve. The
+/// .lcp filename was recorded though, and the digest is derived from the file, so
+/// those rows can be repaired without asking the user anything.
+///
+/// The same trap catches a digest that was once right: Camera Raw ships a revised
+/// .lcp under the same filename and every stored digest for it goes stale. The
+/// digest exists only to name the file on this machine, so whenever the two
+/// disagree the installed file wins.
 enum LensProfileBackfill {
-    /// Fills in the missing digests. Returns how many lenses were repaired.
+    /// Adopts the indexed digest wherever a lens's own differs. Returns how many
+    /// lenses were repaired.
     @discardableResult
     static func run(in context: ModelContext, profiles: [LCPProfile]) throws -> Int {
-        let stale = try context.fetch(FetchDescriptor<UserLens>())
-            .filter { $0.profileDigest.isEmpty && !$0.profileFilename.isEmpty }
-        guard !stale.isEmpty else { return 0 }
+        let lenses = try context.fetch(FetchDescriptor<UserLens>())
+            .filter { !$0.profileFilename.isEmpty }
+        guard !lenses.isEmpty else { return 0 }
 
         var digests: [String: String] = [:]
         for profile in profiles where !profile.digest.isEmpty {
@@ -102,8 +109,12 @@ enum LensProfileBackfill {
         }
 
         var repaired = 0
-        for lens in stale {
-            guard let digest = digests[lens.profileFilename.lowercased()] else { continue }
+        for lens in lenses {
+            // A profile that isn't installed here says nothing about the digest
+            // the lens holds — a Lightroom this app can't see may still have it.
+            guard let digest = digests[lens.profileFilename.lowercased()],
+                  digest != lens.profileDigest
+            else { continue }
             lens.profileDigest = digest
             repaired += 1
         }

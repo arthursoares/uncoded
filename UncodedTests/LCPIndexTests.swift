@@ -94,17 +94,45 @@ final class LCPIndexTests: XCTestCase {
         XCTAssertEqual(manual.profileDigest, "", "a lens with no .lcp has no digest to find")
     }
 
-    func testBackfillNeverOverwritesADigestThatIsAlreadyThere() throws {
+    func testBackfillAdoptsTheDigestOfTheInstalledProfile() throws {
+        // Camera Raw ships a revised .lcp under the same filename and a digest
+        // that was right yesterday now names a file that no longer exists — the
+        // same dead reference an empty digest is.
         let context = try makeContext()
-        let good = lens("Voigtlander VM 35mm f/2 Ultron Aspherical", digest: "DEADBEEF")
-        context.insert(good)
+        let stale = lens("Voigtlander VM 35mm f/2 Ultron Aspherical", digest: "0BS0LETE")
+        context.insert(stale)
         try context.save()
 
         let repaired = try LensProfileBackfill.run(in: context, profiles: [
-            profile(filename: good.profileFilename, digest: "03CBD374CCB89A292AD832BB830E440F"),
+            profile(filename: stale.profileFilename, digest: "03CBD374CCB89A292AD832BB830E440F"),
         ])
-        XCTAssertEqual(repaired, 0)
-        XCTAssertEqual(good.profileDigest, "DEADBEEF")
+        XCTAssertEqual(repaired, 1)
+        XCTAssertEqual(stale.profileDigest, "03CBD374CCB89A292AD832BB830E440F")
+    }
+
+    func testBackfillLeavesAMatchingDigestAlone() throws {
+        let context = try makeContext()
+        let good = lens("Voigtlander VM 35mm f/2 Ultron Aspherical",
+                        digest: "03CBD374CCB89A292AD832BB830E440F")
+        context.insert(good)
+        try context.save()
+
+        XCTAssertEqual(try LensProfileBackfill.run(in: context, profiles: [
+            profile(filename: good.profileFilename, digest: "03CBD374CCB89A292AD832BB830E440F"),
+        ]), 0, "nothing to repair, so nothing is written")
+    }
+
+    func testBackfillKeepsADigestWhoseProfileIsNotInstalledHere() throws {
+        // The user's Lightroom may hold a profile this machine's index doesn't.
+        let context = try makeContext()
+        let lens = lens("Voigtlander VM 35mm f/2 Ultron Aspherical", digest: "03CBD374CCB89A29")
+        context.insert(lens)
+        try context.save()
+
+        XCTAssertEqual(try LensProfileBackfill.run(in: context, profiles: [
+            profile(filename: "Something Else - RAW.lcp", digest: "AABBCC"),
+        ]), 0)
+        XCTAssertEqual(lens.profileDigest, "03CBD374CCB89A29")
     }
 
     func testBackfillIsANoOpWithNoProfilesIndexed() throws {
