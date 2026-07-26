@@ -28,7 +28,16 @@ final class FixerTests: XCTestCase {
     /// frame, which is what the journal's content sample is taken from.
     private func makeTIFF(frame: UInt8 = 1) -> Data {
         let lensModel = Data("Summicron-M 1:2/35 ASPH.".utf8) + Data([0])
-        let xmp = Data((#"<rdf:Description rdf:about=""/>"# + String(repeating: " ", count: 600)).utf8)
+        // A well-formed packet: every prefix declared, and the padding on the
+        // inside of the trailer where the XMP spec puts it.
+        let packet = #"""
+        <?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+        <x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+        <rdf:Description rdf:about=""/>
+        </rdf:RDF></x:xmpmeta>
+        \#(String(repeating: " ", count: 600))<?xpacket end="w"?>
+        """#
+        let xmp = Data(packet.utf8)
         let ifd0Offset = 8
         let ifd0Size = 2 + 2 * 12 + 4
         let xmpOff = ifd0Offset + ifd0Size
@@ -259,6 +268,137 @@ final class FixerTests: XCTestCase {
         try fixer.revert(file: file)
         XCTAssertEqual(try Data(contentsOf: file), original,
                        "the dead appendix must not survive as trailing junk")
+    }
+
+    /// A commit that died *inside* its first write — a full disk part way through
+    /// the appendix. The file is its unfixed self plus a fragment.
+    private func simulatePartialAppendix(_ file: URL) throws -> JournalRecord {
+        let prepared = try TIFFWriter.prepare(write, to: file)
+        XCTAssertGreaterThan(prepared.journal.appendedBytes, 1, "fixture must append")
+        let record = try store.save(prepared.journal)
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data(repeating: 0, count: prepared.journal.appendedBytes / 2))
+        try handle.close()
+        return record
+    }
+
+    func testPartiallyWrittenAppendixIsNotAFixAndIsRecovered() throws {
+        // The length lands strictly between originalLength and writtenLength with
+        // every patch still pre-write. That used to resolve `unverified`: the
+        // frame sealed as maybe-fixed, recovery skipped it, and revert refused it
+        // on its length check — no way back from a write that never touched a
+        // single metadata field.
+        let file = tempDir.appendingPathComponent("photo.dng")
+        let original = makeTIFF()
+        try original.write(to: file)
+        let record = try simulatePartialAppendix(file)
+
+        let length = try Data(contentsOf: file).count
+        XCTAssertGreaterThan(length, record.journal.originalLength)
+        XCTAssertLessThan(length, record.journal.writtenLength, "fixture must be a partial appendix")
+
+        XCTAssertEqual(store.resolve(record), .abandonedWithAppendix)
+        XCTAssertTrue(store.resolve(record).isRecoverable)
+        XCTAssertTrue(store.fixedPaths().isEmpty, "an unfixed file must not read as fixed")
+        XCTAssertTrue(store.sealedURLs(in: [file]).sealed.isEmpty, "and must not be sealed")
+        XCTAssertEqual(journalFiles().count, 1, "the read path must not delete the record")
+
+        try fixer.fix(file: file, with: write, keepBak: false)
+        XCTAssertEqual(journalFiles().count, 1, "the dead record is gone, the new one is not")
+
+        try fixer.revert(file: file)
+        XCTAssertEqual(try Data(contentsOf: file), original,
+                       "the fragment must not survive as trailing junk")
+    }
+
+    func testPartiallyWrittenAppendixIsRecoveredByRevert() throws {
+        let file = tempDir.appendingPathComponent("photo.dng")
+        let original = makeTIFF()
+        try original.write(to: file)
+        _ = try simulatePartialAppendix(file)
+
+        try fixer.revert(file: file)
+        XCTAssertEqual(try Data(contentsOf: file), original)
+        XCTAssertTrue(journalFiles().isEmpty)
+    }
+
+    func testAnEditedFileAtAPartialAppendixLengthIsRefused() throws {
+        // Same length, but a patched region holds bytes from neither state: not
+        // our half-written file, and not ours to roll back.
+        let file = tempDir.appendingPathComponent("photo.dng")
+        try makeTIFF().write(to: file)
+        let record = try simulatePartialAppendix(file)
+
+        var edited = try Data(contentsOf: file)
+        edited[record.journal.patches[0].offset] ^= 0xFF
+        try edited.write(to: file)
+
+        XCTAssertEqual(store.resolve(record), .unverified)
+        XCTAssertThrowsError(try fixer.revert(file: file))
+        XCTAssertEqual(try Data(contentsOf: file), edited, "a refused revert touches nothing")
+    }
+
+    // MARK: - Self-healing profile digest
+
+    func testFixResolvesAnEmptyDigestFromTheInstalledProfile() throws {
+        // LensProfileBackfill runs detached at launch, so a fix started seconds
+        // later can still hold a v0.1.x lens row with no digest — and would write
+        // the unresolvable profile reference the backfill exists to prevent.
+        let file = tempDir.appendingPathComponent("photo.dng")
+        try makeTIFF().write(to: file)
+
+        var stale = write
+        stale.profileDigest = ""
+        stale.profileFilename = "Leica Camera AG (Voigtlander VM 35mm f2 Ultron) - RAW.lcp"
+
+        var asked: [String] = []
+        let healing = Fixer(store: store, profileDigest: { filename in
+            asked.append(filename)
+            return filename == stale.profileFilename ? "03CBD374CCB89A292AD832BB830E440F" : nil
+        })
+        try healing.fix(file: file, with: stale, keepBak: false)
+
+        XCTAssertEqual(asked, [stale.profileFilename])
+        XCTAssertEqual(try TIFFReader.read(url: file).profileDigest,
+                       "03CBD374CCB89A292AD832BB830E440F",
+                       "the written packet must carry the installed profile's digest")
+    }
+
+    func testFixLeavesADigestTheLensAlreadyHasAlone() throws {
+        // A digest that disagrees with the installed file is the backfill's
+        // business; writing something other than what the UI shows would be worse.
+        let file = tempDir.appendingPathComponent("photo.dng")
+        try makeTIFF().write(to: file)
+
+        var asked = false
+        let healing = Fixer(store: store, profileDigest: { _ in
+            asked = true
+            return "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        })
+        try healing.fix(file: file, with: write, keepBak: false)
+
+        XCTAssertFalse(asked, "a lens that has a digest is not looked up")
+        XCTAssertEqual(try TIFFReader.read(url: file).profileDigest, write.profileDigest)
+    }
+
+    func testFixWithNoInstalledProfileWritesNoDigest() throws {
+        // Nothing to heal with: the write goes ahead without a digest rather than
+        // inventing one, and skips the crs block entirely.
+        let file = tempDir.appendingPathComponent("photo.dng")
+        try makeTIFF().write(to: file)
+
+        var bare = write
+        bare.profileDigest = ""
+        bare.profileFilename = ""
+        bare.profileName = ""
+
+        let healing = Fixer(store: store, profileDigest: { _ in
+            XCTFail("a lens with no .lcp filename has nothing to look up")
+            return nil
+        })
+        try healing.fix(file: file, with: bare, keepBak: false)
+        XCTAssertNil(try TIFFReader.read(url: file).profileDigest)
     }
 
     /// A commit that died part way through its patch loop: appendix written,
@@ -510,7 +650,9 @@ final class FixerTests: XCTestCase {
         // Something else edits the file between the two fixes (Lightroom
         // writing metadata back, say): our .bak no longer matches it.
         var edited = original
-        edited[100] = 0x0A // inside the XMP packet's padding
+        // Inside the XMP packet's padding: the bytes differ, the structure holds.
+        let padding = try XCTUnwrap(edited.range(of: Data(repeating: 0x20, count: 64)))
+        edited[padding.lowerBound + 8] = 0x0A
         try edited.write(to: file)
 
         let outcome = try fixer.fix(file: file, with: otherWrite, keepBak: true)

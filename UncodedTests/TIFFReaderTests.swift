@@ -93,7 +93,9 @@ final class TIFFReaderTests: XCTestCase {
     // MARK: - Real files (runs only when UNCODED_TEST_DNG points at one)
 
     func testAgainstRealDNGIfProvided() throws {
-        guard let path = ProcessInfo.processInfo.environment["UNCODED_TEST_DNG"] else {
+        // The scheme forwards the variable unconditionally, so "unset" arrives
+        // as an empty string rather than as a missing key.
+        guard let path = ProcessInfo.processInfo.environment["UNCODED_TEST_DNG"], !path.isEmpty else {
             throw XCTSkip("set UNCODED_TEST_DNG=/path/to/file.dng to run")
         }
         let meta = try TIFFReader.read(url: URL(fileURLWithPath: path))

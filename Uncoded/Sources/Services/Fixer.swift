@@ -98,6 +98,7 @@ struct JournalStore: Sendable {
     ///
     ///     length \ patched regions   all pre-write   all post-write   mixed
     ///     originalLength             abandoned       interrupted¹     interrupted
+    ///     part of an appendix³       appendix only²  unverified       unverified
     ///     writtenLength              appendix only²  landed           interrupted
     ///     anything else              unverified      unverified       unverified
     ///
@@ -105,21 +106,27 @@ struct JournalStore: Sendable {
     /// length: something other than us wrote there and only the user knows
     /// what it was. `unverified` is also where an unreadable file lands.
     ///
-    /// The three interrupted states are recoverable *because* every region is
-    /// provably one of ours: restoring the pre-write bytes and truncating to
+    /// The interrupted states are recoverable *because* every region is provably
+    /// one of ours: restoring the pre-write bytes and truncating to
     /// `originalLength` puts the file back where it started. Only pending
     /// journals are audited at all — a committed one plus a mixed file is not
     /// an interrupted write, it is a file edited after the fix.
     ///
     /// ¹ patches without the appendix that was written first: pathological, but
     ///   the fields would point past end-of-file, so recover rather than seal.
-    /// ² the appendix landed and no patch did.
+    /// ² the appendix landed — all or part of it — and no patch did.
+    /// ³ `originalLength < length < writtenLength`: the appendix write itself
+    ///   died part way, which a full disk does. Nothing on disk differs from the
+    ///   original file except the fragment past `originalLength`. Post-write or
+    ///   mixed regions at that length would mean patches landed before the
+    ///   appendix they depend on, which `commit` cannot do — so, unverified.
     enum Resolution: Equatable {
         /// The write is on disk (or the journal predates the pending split).
         case landed
         /// The journal describes a write that never reached the file.
         case abandoned
-        /// The appendix reached end-of-file but none of the patches did.
+        /// Some or all of the appendix reached end-of-file; none of the patches
+        /// did. Truncating the fragment away restores the file.
         case abandonedWithAppendix
         /// The write stopped part way through its patches.
         case interrupted
@@ -161,6 +168,16 @@ struct JournalStore: Sendable {
             return .abandoned
         case journal.originalLength:
             return .interrupted
+        case let length where length > journal.originalLength
+            && length < journal.writtenLength && audit.allOriginal:
+            // The appendix write died part way through — a full disk inside the
+            // very first write of the commit. Every patched region is still
+            // pre-write, so the only thing on disk that is not the original file
+            // is the fragment past originalLength. This used to fall to
+            // `unverified`, which sealed the frame as maybe-fixed, skipped it in
+            // recovery, and left revert refusing it on its length check: a frame
+            // with no way back from a write that never touched its metadata.
+            return .abandonedWithAppendix
         default:
             return .unverified
         }
@@ -351,8 +368,15 @@ struct JournalStore: Sendable {
 struct Fixer: Sendable {
     let store: JournalStore
 
-    init(store: JournalStore = .default) {
+    /// Resolves an installed .lcp's digest from its filename. Injectable so tests
+    /// don't depend on which profiles Adobe happens to have installed.
+    let profileDigest: @Sendable (String) -> String?
+
+    init(store: JournalStore = .default,
+         profileDigest: @escaping @Sendable (String) -> String?
+             = { LCPIndex.cachedDigest(forProfileNamed: $0) }) {
         self.store = store
+        self.profileDigest = profileDigest
     }
 
     static let `default` = Fixer()
@@ -384,6 +408,7 @@ struct Fixer: Sendable {
     @discardableResult
     func fix(file: URL, with write: LensWrite, keepBak: Bool) throws -> FixOutcome {
         var outcome = FixOutcome()
+        let write = resolvingProfileDigest(write)
 
         // A fix is a mutation, so this is where the leftovers of an interrupted
         // one are cleaned up — before planning, since a stale appendix would
@@ -461,6 +486,28 @@ struct Fixer: Sendable {
         // error: a pending journal is resolved against the file's bytes.
         try? store.finalize(record)
         return outcome
+    }
+
+    /// Fills in a digest the lens row doesn't have yet.
+    ///
+    /// `LensProfileBackfill` repairs the stored rows at launch, but it runs
+    /// detached: a fix started seconds after launch can still be holding a lens
+    /// saved by v0.1.x, and would write the very thing the backfill exists to
+    /// prevent — `crs:LensProfileSetup="Custom"` beside an empty digest, a
+    /// profile reference Lightroom cannot resolve. So the write resolves its own
+    /// digest from the .lcp named in the row. Only an empty one: a digest that
+    /// disagrees with the installed file is the backfill's business, and silently
+    /// writing something other than what the UI shows would be worse.
+    ///
+    /// The row itself is left alone — this is a `LensWrite`, not the model, and
+    /// the fix path has no business saving to the store.
+    private func resolvingProfileDigest(_ write: LensWrite) -> LensWrite {
+        guard write.profileDigest.isEmpty, !write.profileFilename.isEmpty,
+              let digest = profileDigest(write.profileFilename), !digest.isEmpty
+        else { return write }
+        var healed = write
+        healed.profileDigest = digest
+        return healed
     }
 
     /// Cleans up after a fix that died mid-commit: a journal for a write that

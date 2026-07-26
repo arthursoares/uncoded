@@ -11,8 +11,10 @@ Successor to the `fix_6bit_exif` CLI.
 - Build: `xcodebuild -scheme Uncoded -configuration Debug -derivedDataPath build/DerivedData build`
 - Test: `xcodebuild -scheme Uncoded -derivedDataPath build/DerivedData test`
 - DMG: `scripts/make_dmg.sh <path/to/Uncoded.app> dist`
-- Real-file reader test: set env `UNCODED_TEST_DNG=/path/to/file.dng`
-  (pass via `TEST_RUNNER_UNCODED_TEST_DNG` with xcodebuild)
+- Real-file tests (reader + writer/exiftool round-trip): pass
+  `UNCODED_TEST_DNG=/path/to/copy.dng` as a build setting to xcodebuild —
+  the scheme forwards it (`project.yml`), because Xcode scrubs the
+  environment of a hosted test bundle. Skipped when unset or empty.
 
 ## Git flow & releases
 
