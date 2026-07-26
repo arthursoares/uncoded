@@ -24,7 +24,9 @@ final class FixerTests: XCTestCase {
         Data([UInt8(v & 0xFF), UInt8((v >> 8) & 0xFF), UInt8((v >> 16) & 0xFF), UInt8(v >> 24)])
     }
 
-    private func makeTIFF() -> Data {
+    /// `frame` stands in for image data: bytes no IFD points at, unique per
+    /// frame, which is what the journal's content sample is taken from.
+    private func makeTIFF(frame: UInt8 = 1) -> Data {
         let lensModel = Data("Summicron-M 1:2/35 ASPH.".utf8) + Data([0])
         let xmp = Data((#"<rdf:Description rdf:about=""/>"# + String(repeating: " ", count: 600)).utf8)
         let ifd0Offset = 8
@@ -44,6 +46,7 @@ final class FixerTests: XCTestCase {
         data += u16(0xA434) + u16(2) + u32(UInt32(lensModel.count)) + u32(UInt32(lensModelOff))
         data += u32(0)
         data += lensModel
+        data += Data((0..<4096).map { UInt8(($0 &* 31 &+ Int(frame)) & 0xFF) })
         return data
     }
 
@@ -155,9 +158,11 @@ final class FixerTests: XCTestCase {
 
     // MARK: - Journal safety
 
-    func testJournalIsSavedBeforeTheWrite() throws {
+    func testJournalIsSavedBeforeTheWriteAndReadsNeverPruneIt() throws {
         // The journal must exist while the file is still pristine: a crash
-        // between the two leaves an undo record, not an orphaned rewrite.
+        // between the two leaves an undo record, not an orphaned rewrite. And
+        // in that window the record looks exactly like one for a write that
+        // never happened — a scan running concurrently must not delete it.
         let file = tempDir.appendingPathComponent("photo.dng")
         let original = makeTIFF()
         try original.write(to: file)
@@ -167,27 +172,39 @@ final class FixerTests: XCTestCase {
         let record = try store.save(prepared.journal)
         XCTAssertFalse(record.journal.isCommitted, "a pre-write journal is pending")
 
-        // The interrupted-before-commit case: the pending journal describes a
-        // write that never landed, so the file is not fixed and it is pruned.
-        XCTAssertTrue(store.fixedPaths().isEmpty)
-        XCTAssertTrue(journalFiles().isEmpty, "an abandoned pending journal is pruned")
+        XCTAssertTrue(store.fixedPaths().isEmpty, "the write hasn't landed, so no seal")
+        XCTAssertEqual(journalFiles().count, 1, "a read path must never delete a journal")
 
         // The interrupted-after-commit case: the same journal, now matching the
         // bytes on disk, counts as a fix and is finalized in passing.
-        let second = try store.save(prepared.journal)
         try prepared.commit()
         XCTAssertEqual(store.fixedPaths(), [file.path])
         XCTAssertEqual(store.journal(for: file)?.journal.isCommitted, true)
         XCTAssertEqual(journalFiles().count, 1)
-        XCTAssertEqual(second.url.lastPathComponent, journalFiles().first?.lastPathComponent)
 
         try fixer.revert(file: file)
         XCTAssertEqual(try Data(contentsOf: file), original)
     }
 
-    func testUnwritableJournalDirectoryStillFixesWithWarning() throws {
-        // A journal directory that cannot be created must not turn into "the
-        // fix failed" — the write is what the user asked for.
+    func testAbandonedJournalIsPrunedByTheNextFix() throws {
+        let file = tempDir.appendingPathComponent("photo.dng")
+        let original = makeTIFF()
+        try original.write(to: file)
+
+        // A fix that died before its commit.
+        _ = try store.save(try TIFFWriter.prepare(write, to: file).journal)
+
+        try fixer.fix(file: file, with: write, keepBak: false)
+        XCTAssertEqual(journalFiles().count, 1, "the dead record is pruned by the mutation path")
+
+        try fixer.revert(file: file)
+        XCTAssertEqual(try Data(contentsOf: file), original)
+        XCTAssertTrue(journalFiles().isEmpty)
+    }
+
+    func testUnwritableJournalDirectoryAbortsBeforeWriting() throws {
+        // No undo record means no way back, and the file has not been touched
+        // yet — so this must fail loudly instead of quietly rewriting the DNG.
         let blocker = tempDir.appendingPathComponent("blocked")
         try Data("not a directory".utf8).write(to: blocker)
         let blockedFixer = Fixer(store: JournalStore(directory: blocker.appendingPathComponent("journals")))
@@ -196,11 +213,155 @@ final class FixerTests: XCTestCase {
         let original = makeTIFF()
         try original.write(to: file)
 
-        let outcome = try blockedFixer.fix(file: file, with: write, keepBak: false)
-        XCTAssertNotEqual(try Data(contentsOf: file), original, "the fix must still land")
-        XCTAssertEqual(outcome.warnings.count, 1)
-        XCTAssertTrue(outcome.warnings[0].contains("Revert is not available"),
-                      "unexpected warning: \(outcome.warnings)")
+        XCTAssertThrowsError(try blockedFixer.fix(file: file, with: write, keepBak: true)) { error in
+            XCTAssertTrue(error.localizedDescription.contains("undo record"),
+                          "unexpected error: \(error.localizedDescription)")
+        }
+        XCTAssertEqual(try Data(contentsOf: file), original, "nothing may be written")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.appendingPathExtension("bak").path),
+                       "the abandoned fix takes its backup copy with it")
+    }
+
+    // MARK: - Interrupted commits
+
+    /// A commit that died between writing its appendix and writing its patches:
+    /// the file is its unfixed self with dead bytes glued on.
+    private func simulateInterruptedAppendix(_ file: URL) throws -> JournalRecord {
+        let prepared = try TIFFWriter.prepare(write, to: file)
+        XCTAssertGreaterThan(prepared.journal.appendedBytes, 0, "fixture must append")
+        let record = try store.save(prepared.journal)
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data(repeating: 0, count: prepared.journal.appendedBytes))
+        try handle.close()
+        return record
+    }
+
+    func testAppendixWithoutPatchesIsNotAFix() throws {
+        let file = tempDir.appendingPathComponent("photo.dng")
+        try makeTIFF().write(to: file)
+        let record = try simulateInterruptedAppendix(file)
+
+        XCTAssertEqual(store.resolve(record), .abandonedWithAppendix)
+        XCTAssertTrue(store.fixedPaths().isEmpty, "an unfixed file must not read as fixed")
+        XCTAssertEqual(journalFiles().count, 1, "and the read path must not delete the record")
+    }
+
+    func testInterruptedAppendixIsRecoveredByTheNextFix() throws {
+        let file = tempDir.appendingPathComponent("photo.dng")
+        let original = makeTIFF()
+        try original.write(to: file)
+        _ = try simulateInterruptedAppendix(file)
+
+        try fixer.fix(file: file, with: write, keepBak: false)
+        XCTAssertEqual(journalFiles().count, 1, "the dead record is gone, the new one is not")
+
+        try fixer.revert(file: file)
+        XCTAssertEqual(try Data(contentsOf: file), original,
+                       "the dead appendix must not survive as trailing junk")
+    }
+
+    func testInterruptedAppendixIsRecoveredByRevert() throws {
+        let file = tempDir.appendingPathComponent("photo.dng")
+        let original = makeTIFF()
+        try original.write(to: file)
+        _ = try simulateInterruptedAppendix(file)
+
+        try fixer.revert(file: file)
+        XCTAssertEqual(try Data(contentsOf: file), original)
+        XCTAssertTrue(journalFiles().isEmpty)
+    }
+
+    // MARK: - Copies and twins
+
+    func testRevertOfACopyDoesNotConsumeTheOriginalsJournal() throws {
+        let a = tempDir.appendingPathComponent("a.dng")
+        let original = makeTIFF()
+        try original.write(to: a)
+        try fixer.fix(file: a, with: write, keepBak: false)
+
+        // A copy of the fixed file: same content, no journal of its own.
+        let b = tempDir.appendingPathComponent("b.dng")
+        try FileManager.default.copyItem(at: a, to: b)
+
+        XCTAssertThrowsError(try fixer.revert(file: b)) { error in
+            let message = error.localizedDescription
+            XCTAssertTrue(message.contains("a.dng") && message.contains("b.dng"),
+                          "the error must name both files: \(message)")
+        }
+        XCTAssertEqual(journalFiles().count, 1, "the original's undo record survives")
+        XCTAssertEqual(store.fixedPaths(), [a.path])
+
+        XCTAssertThrowsError(try fixer.fix(file: b, with: otherWrite, keepBak: false)) { error in
+            XCTAssertTrue(error.localizedDescription.contains("is a copy of"),
+                          "a still-present original is a copy, not a rename: \(error.localizedDescription)")
+        }
+
+        try fixer.revert(file: a)
+        XCTAssertEqual(try Data(contentsOf: a), original)
+    }
+
+    func testRefixPrefersThisFilesOwnJournalOverATwins() throws {
+        let a = tempDir.appendingPathComponent("a.dng")
+        let b = tempDir.appendingPathComponent("b.dng")
+        let original = makeTIFF()
+        try original.write(to: a)
+        try original.write(to: b)
+
+        // Both frames byte-identical and fixed the same way: each journal
+        // claims both files' content, and b's is the newest.
+        try fixer.fix(file: a, with: write, keepBak: false)
+        try fixer.fix(file: b, with: write, keepBak: false)
+
+        XCTAssertEqual(store.journalClaiming(a)?.journal.filePath, a.path)
+        XCTAssertNoThrow(try fixer.fix(file: a, with: otherWrite, keepBak: false),
+                         "a file with its own journal is not a renamed copy of another")
+
+        try fixer.revert(file: a)
+        XCTAssertEqual(try Data(contentsOf: a), original)
+        XCTAssertEqual(store.fixedPaths(), [b.path])
+    }
+
+    func testContentMatchDistinguishesFramesWithTheSameLens() throws {
+        // Two different frames, same lens: the patched regions are identical, so
+        // only the sample of image data tells the journals apart.
+        let b = tempDir.appendingPathComponent("b.dng")
+        let a = tempDir.appendingPathComponent("a.dng")
+        let originalB = makeTIFF(frame: 2)
+        try originalB.write(to: b)
+        try makeTIFF(frame: 1).write(to: a)
+
+        try fixer.fix(file: b, with: write, keepBak: false)
+        try fixer.fix(file: a, with: write, keepBak: false) // newest journal
+
+        let renamed = tempDir.appendingPathComponent("b-imported.dng")
+        try FileManager.default.moveItem(at: b, to: renamed)
+
+        XCTAssertEqual(store.journalClaiming(renamed)?.journal.filePath, b.path,
+                       "a renamed frame must match its own journal, not a newer one for another frame")
+        try fixer.revert(file: renamed)
+        XCTAssertEqual(try Data(contentsOf: renamed), originalB)
+        XCTAssertEqual(store.fixedPaths(), [a.path])
+    }
+
+    func testRevertReportsAJournalItCannotDelete() throws {
+        let file = tempDir.appendingPathComponent("photo.dng")
+        let original = makeTIFF()
+        try original.write(to: file)
+        try fixer.fix(file: file, with: write, keepBak: false)
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o500],
+                                             ofItemAtPath: store.directory.path)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700],
+                                                  ofItemAtPath: store.directory.path)
+        }
+
+        XCTAssertThrowsError(try fixer.revert(file: file)) { error in
+            XCTAssertTrue(error.localizedDescription.contains("could not be deleted"),
+                          "unexpected error: \(error.localizedDescription)")
+        }
+        XCTAssertEqual(try Data(contentsOf: file), original, "the bytes still went back")
     }
 
     func testWriteFailureRemovesTheBakItCreated() throws {
