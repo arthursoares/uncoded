@@ -1,4 +1,6 @@
+import CryptoKit
 import Foundation
+import SwiftData
 
 /// One Adobe lens-correction profile (.lcp) found on this machine.
 struct LCPProfile: Identifiable, Hashable, Sendable {
@@ -8,6 +10,9 @@ struct LCPProfile: Identifiable, Hashable, Sendable {
     let cameraModel: String? // stCamera:Model, the body the profile was measured on
     let lensPrettyName: String? // stCamera:LensPrettyName
     let profileName: String? // stCamera:ProfileName
+    /// What goes in XMP `crs:LensProfileDigest`: uppercase-hex MD5 of the .lcp
+    /// file's bytes. Empty when the file could not be read.
+    let digest: String
 
     var id: URL { url }
 }
@@ -63,8 +68,58 @@ enum LCPIndex {
             cameraMake: delegate.attributes["stCamera:Make"],
             cameraModel: delegate.attributes["stCamera:Model"],
             lensPrettyName: delegate.attributes["stCamera:LensPrettyName"],
-            profileName: delegate.attributes["stCamera:ProfileName"]
+            profileName: delegate.attributes["stCamera:ProfileName"],
+            digest: digest(of: url) ?? ""
         )
+    }
+
+    /// The digest Lightroom stamps into `crs:LensProfileDigest` — the MD5 of the
+    /// .lcp file's bytes, uppercase hex. MD5 is not a security choice here: it is
+    /// the identifier Adobe already chose, so it has to match byte for byte or
+    /// Lightroom will not recognise the profile reference.
+    static func digest(of url: URL) -> String? {
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
+        return Insecure.MD5.hash(data: data).map { String(format: "%02X", $0) }.joined()
+    }
+}
+
+/// Repairs `UserLens` rows saved before Uncoded knew how to compute a profile
+/// digest. v0.1.x left `profileDigest` empty on every lens, so every fix it made
+/// wrote `crs:LensProfileDigest=""` — a profile reference Lightroom cannot
+/// resolve. The .lcp filename was recorded though, and the digest is derived
+/// from the file, so the rows can be repaired without asking the user anything.
+enum LensProfileBackfill {
+    /// Fills in the missing digests. Returns how many lenses were repaired.
+    @discardableResult
+    static func run(in context: ModelContext, profiles: [LCPProfile]) throws -> Int {
+        let stale = try context.fetch(FetchDescriptor<UserLens>())
+            .filter { $0.profileDigest.isEmpty && !$0.profileFilename.isEmpty }
+        guard !stale.isEmpty else { return 0 }
+
+        var digests: [String: String] = [:]
+        for profile in profiles where !profile.digest.isEmpty {
+            digests[profile.url.lastPathComponent.lowercased()] = profile.digest
+        }
+
+        var repaired = 0
+        for lens in stale {
+            guard let digest = digests[lens.profileFilename.lowercased()] else { continue }
+            lens.profileDigest = digest
+            repaired += 1
+        }
+        if repaired > 0 { try context.save() }
+        return repaired
+    }
+
+    /// Runs the backfill at launch. Indexing and hashing ~170 .lcp files is disk
+    /// work, so it happens off the main actor on its own context; a failure is
+    /// silent because the app is perfectly usable without it.
+    static func runAtLaunch(container: ModelContainer) {
+        Task.detached(priority: .utility) {
+            let profiles = LCPIndex.indexMMount()
+            guard !profiles.isEmpty else { return }
+            _ = try? run(in: ModelContext(container), profiles: profiles)
+        }
     }
 }
 

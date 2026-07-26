@@ -139,6 +139,7 @@ struct AddLensSheet: View {
     @State private var aperture = ""
     @State private var profileName = ""
     @State private var profileFilename = ""
+    @State private var profileDigest = ""
     @State private var selectedCode: String?
     @State private var codeAutoSelected = true
 
@@ -263,6 +264,9 @@ struct AddLensSheet: View {
         make = pretty.split(separator: " ").first.map(String.init) ?? profile.maker
         profileName = profile.profileName ?? ""
         profileFilename = profile.url.lastPathComponent
+        // Without the digest, Lightroom cannot resolve the profile reference the
+        // fix writes — see LensProfileBackfill.
+        profileDigest = profile.digest
         if let id = LensNameParser.parse(pretty) {
             focalLength = "\(id.focalMM).0mm"
             let ap = Double(id.apertureX10) / 10
@@ -278,7 +282,7 @@ struct AddLensSheet: View {
     private func save() {
         let lens = UserLens(name: name, make: make, focalLength: focalLength,
                             aperture: aperture, profileName: profileName,
-                            profileFilename: profileFilename)
+                            profileFilename: profileFilename, profileDigest: profileDigest)
         context.insert(lens)
         if let code = selectedCode {
             Mappings.assign(code: code, to: lens, in: context)
