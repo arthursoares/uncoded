@@ -57,6 +57,19 @@ final class DNGScannerTests: XCTestCase {
         XCTAssertTrue(outcome.files.isEmpty)
     }
 
+    /// Stand-in for a TCC-blocked folder: listable-by-nobody.
+    func testUnlistableFolderReportsUnreadable() throws {
+        let fm = FileManager.default
+        let denied = root.appendingPathComponent("denied", isDirectory: true)
+        try fm.createDirectory(at: denied, withIntermediateDirectories: true)
+        try fm.setAttributes([.posixPermissions: 0o000], ofItemAtPath: denied.path)
+        defer { try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: denied.path) }
+
+        let outcome = DNGScanner.scan(folder: denied)
+        XCTAssertFalse(outcome.folderReadable)
+        XCTAssertTrue(outcome.files.isEmpty)
+    }
+
     func testSingleDNGFileScansAsOneFrame() throws {
         let file = root.appendingPathComponent("single.dng")
         try minimalTIFF().write(to: file)

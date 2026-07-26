@@ -44,7 +44,9 @@ enum DNGScanner {
         var urls: [URL] = []
 
         if folder.hasDirectoryPath {
-            guard fm.isReadableFile(atPath: folder.path),
+            // access(R_OK) can still succeed where TCC blocks opendir, so probe
+            // by actually listing the directory.
+            guard (try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) != nil,
                   let found = fm.enumerator(at: folder, includingPropertiesForKeys: nil)
             else { return Outcome(folderReadable: false) }
             for case let url as URL in found where url.pathExtension.lowercased() == "dng" {
@@ -52,8 +54,6 @@ enum DNGScanner {
             }
         } else if folder.pathExtension.lowercased() == "dng" {
             urls = [folder]
-        } else if !fm.isReadableFile(atPath: folder.path) {
-            return Outcome(folderReadable: false)
         }
 
         var outcome = Outcome()
