@@ -390,7 +390,8 @@ struct Fixer: Sendable {
     /// reached the file is never reported as a failure — at most as a success
     /// with a warning about the backup. (Anything that would leave the write
     /// un-undoable is refused before the write instead, so it can still be
-    /// thrown: warnings have no home in the UI yet.)
+    /// thrown.) The warnings ride along on `FrameFix.fixed`, which keeps the
+    /// frame's seal and marks it.
     struct FixOutcome {
         var warnings: [String] = []
     }

@@ -10,7 +10,11 @@ struct Resolution {
 
 /// Per-file fix outcome for the current session.
 enum FrameFix {
-    case fixed
+    /// A write that landed. `warnings` carries what `Fixer.FixOutcome` had to
+    /// say about a fix that nonetheless succeeded — a .bak that no longer
+    /// matches the file it was made from, most of all. The frame keeps its
+    /// FIXED seal: the warning is about the backup, not about the write.
+    case fixed(warnings: [String])
     case failed(String)
     /// A revert that did not happen — the file changed since the fix, or its
     /// journal is gone. The bytes on disk are still ours, so the frame keeps
@@ -33,9 +37,16 @@ enum FrameFix {
     /// The full, untruncated explanation, if there is one.
     var message: String? {
         switch self {
-        case .fixed: return nil
+        case .fixed(let warnings):
+            return warnings.isEmpty ? nil : warnings.joined(separator: "\n\n")
         case .failed(let message), .revertRefused(let message): return message
         }
+    }
+
+    /// Things that went sideways around a write that still landed.
+    var warnings: [String] {
+        if case .fixed(let warnings) = self { return warnings }
+        return []
     }
 }
 

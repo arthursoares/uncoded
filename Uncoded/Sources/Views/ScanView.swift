@@ -651,6 +651,7 @@ struct ScanView: View {
         session.fixProgress = (0, work.count)
         session.batchTask = Task {
             var fixed = 0
+            var warned = 0
             var failed = 0
             var stopped = false
             for (index, item) in work.enumerated() {
@@ -662,15 +663,18 @@ struct ScanView: View {
                 let (url, write) = item
                 let outcome: FrameFix = await Task.detached(priority: .userInitiated) {
                     do {
-                        try Fixer.fix(file: url, with: write, keepBak: bak)
-                        return .fixed
+                        let result = try Fixer.fix(file: url, with: write, keepBak: bak)
+                        return .fixed(warnings: result.warnings)
                     } catch {
                         return .failed(error.localizedDescription)
                     }
                 }.value
                 session.fixState[url] = outcome
-                if case .fixed = outcome {
+                if case .fixed(let warnings) = outcome {
                     fixed += 1
+                    // The write landed; the warning is about the .bak beside
+                    // it. Counted apart so the summary doesn't imply a failure.
+                    if !warnings.isEmpty { warned += 1 }
                     await refresh(url)
                 } else {
                     failed += 1
@@ -678,6 +682,7 @@ struct ScanView: View {
                 session.fixProgress = (index + 1, work.count)
             }
             finish(summary: summary(done: fixed, doneVerb: "fixed",
+                                    doneNote: warned > 0 ? "\(warned) with warnings" : nil,
                                     problems: failed, problemVerb: "failed",
                                     skipped: stopped ? work.count - fixed - failed : 0))
         }
@@ -733,10 +738,11 @@ struct ScanView: View {
         session.batchTask = nil
     }
 
-    /// "12 fixed, 1 failed" / "3 reverted, 2 refused" — the batch's own words.
-    private func summary(done: Int, doneVerb: String,
+    /// "12 fixed (2 with warnings), 1 failed" / "3 reverted, 2 refused" — the
+    /// batch's own words.
+    private func summary(done: Int, doneVerb: String, doneNote: String? = nil,
                          problems: Int, problemVerb: String, skipped: Int) -> String {
-        var parts = ["\(done) \(doneVerb)"]
+        var parts = ["\(done) \(doneVerb)" + (doneNote.map { " (\($0))" } ?? "")]
         if problems > 0 { parts.append("\(problems) \(problemVerb)") }
         if skipped > 0 { parts.append("\(skipped) not attempted") }
         return parts.joined(separator: ", ")
@@ -777,7 +783,7 @@ struct ScanView: View {
             // Files with a persisted journal were fixed in an earlier session —
             // restore their FIXED seals so revert stays reachable.
             for file in outcome.files where journaled.contains(file.url.path) {
-                session.fixState[file.url] = .fixed
+                session.fixState[file.url] = .fixed(warnings: [])
             }
             session.scanning = false
         }
@@ -840,6 +846,8 @@ private struct FrameCell: View {
     let selected: Bool
 
     @State private var image: NSImage?
+
+    private var warnings: [String] { fix?.warnings ?? [] }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -908,6 +916,20 @@ private struct FrameCell: View {
                         .foregroundStyle(Theme.ok)
                         .lineLimit(1)
                     EngravedLabel("fixed", color: Theme.ok)
+                    // The write landed; something about the backup beside it
+                    // did not. A tick, not an alarm.
+                    if !warnings.isEmpty {
+                        Image(systemName: "exclamationmark.circle.fill")
+                            .font(.system(size: 8))
+                            .foregroundStyle(Theme.rebate)
+                    }
+                }
+                if !warnings.isEmpty {
+                    Text(warnings.joined(separator: "\n"))
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.rebate)
+                        .lineLimit(4)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 if case .revertRefused(let message) = fix {
                     EngravedLabel("revert refused", color: Theme.rebate)
@@ -977,8 +999,9 @@ private struct FrameCell: View {
             lines.append("actually: \(lens.name)\(resolution.isManual ? " (manual)" : "")")
         }
         switch fix {
-        case .fixed:
+        case .fixed(let warnings):
             lines.append("fixed — right-click to revert")
+            lines.append(contentsOf: warnings)
         case .revertRefused(let message):
             lines.append("still fixed; revert refused: \(message)")
             lines.append("right-click to try the revert again")
@@ -1002,6 +1025,8 @@ private struct ScanRow: View {
     let resolution: Resolution
     let fix: FrameFix?
     let refixLens: UserLens?
+
+    private var warnings: [String] { fix?.warnings ?? [] }
 
     var body: some View {
         HStack(spacing: 14) {
@@ -1030,6 +1055,16 @@ private struct ScanRow: View {
                             .font(.system(size: 8))
                             .foregroundStyle(Theme.ok)
                         EngravedLabel("fixed", color: Theme.ok)
+                        // The write landed; the backup beside it is the worry.
+                        if !warnings.isEmpty {
+                            Image(systemName: "exclamationmark.circle.fill")
+                                .font(.system(size: 8))
+                                .foregroundStyle(Theme.rebate)
+                            Text(warnings.joined(separator: "\n"))
+                                .font(.system(size: 10))
+                                .foregroundStyle(Theme.rebate)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
                     if case .revertRefused(let message) = fix {
                         HStack(spacing: 5) {
