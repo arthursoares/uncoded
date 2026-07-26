@@ -44,10 +44,21 @@ struct ScanView: View {
         private(set) var mappedCount = 0
         private(set) var fixedCount = 0
         private(set) var failureCount = 0
-        /// Codes no lens of the user's claims, keyed by the candidate list of
-        /// the frames wearing them — one entry per code normally, and one per
-        /// pair when the camera's lens name fits more than one code.
-        private(set) var unclaimedCodes: [[String]: Int] = [:]
+        /// Frames the scan can't route, grouped by the codes they wear — one
+        /// entry per code normally, and one per pair when the camera's lens
+        /// name fits more than one code.
+        private(set) var unclaimedCodes: [[String]: UnclaimedGroup] = [:]
+
+        /// One such group, and why it is stuck. `contested` means the codes
+        /// *are* claimed — by two different lenses — so mapping a code is no
+        /// way out of it; only the user can say which lens shot these frames.
+        struct UnclaimedGroup {
+            var codes: [String] = []
+            var frames: [URL] = []
+            var contested = false
+
+            var count: Int { frames.count }
+        }
 
         init(session: ScanSession, mappings: [CodeMapping], lenses: [UserLens]) {
             // The lens each mapped code points at. First row wins per code.
@@ -91,7 +102,14 @@ struct ScanView: View {
                 if state?.isFixed == true { fixedCount += 1 }
                 if state?.isFailure == true { failureCount += 1 }
                 if resolution.lens == nil, state == nil, !file.codeCandidates.isEmpty {
-                    unclaimedCodes[file.codeCandidates.map(\.code), default: 0] += 1
+                    let codes = file.codeCandidates.map(\.code)
+                    // Reaching here with any candidate mapped means two of them
+                    // are mapped to *different* lenses — one mapped candidate
+                    // would have resolved the frame in the first place.
+                    var group = unclaimedCodes[codes] ?? UnclaimedGroup(
+                        codes: codes, contested: codes.contains { lensByCode[$0] != nil })
+                    group.frames.append(file.url)
+                    unclaimedCodes[codes] = group
                 }
                 if let target = Self.target(file: file, resolution: resolution, state: state) {
                     targets.append(target)
@@ -134,15 +152,11 @@ struct ScanView: View {
             return target.lens
         }
 
-        /// The most frequent unclaimed code — the one to suggest claiming
-        /// first. More than one code means the frames' lens name fits several
-        /// and the file records none of them; the banner offers all of them
-        /// rather than picking.
-        var topUnclaimedCode: (codes: [String], count: Int)? {
-            guard let best = unclaimedCodes.max(by: {
-                ($0.value, $1.key.joined()) < ($1.value, $0.key.joined())
-            }) else { return nil }
-            return (best.key, best.value)
+        /// The biggest group of stuck frames — the one worth unsticking first.
+        var topUnclaimedCode: UnclaimedGroup? {
+            unclaimedCodes.values.max {
+                ($0.count, $1.codes.joined()) < ($1.count, $0.codes.joined())
+            }
         }
     }
 
@@ -524,24 +538,34 @@ struct ScanView: View {
         return "\(verb(targets)) \(count) frame\(count == 1 ? "" : "s")"
     }
 
-    /// The road out of the "0 mapped" dead end: an unclaimed code with a
-    /// direct route to claiming it. When the camera's lens name fits more than
-    /// one code the frames are just as unclaimed, so they get the same banner —
-    /// with every candidate on offer, since only the user knows which one is
-    /// engraved on the lens.
-    private func unclaimedBanner(_ top: (codes: [String], count: Int)) -> some View {
+    /// The road out of the "0 mapped" dead end: stuck frames, and the way out
+    /// of the particular way they are stuck. An unclaimed code gets the route
+    /// to claiming it; a lens name that fits several codes gets all of them,
+    /// since only the user knows which one is engraved. And codes that are
+    /// *already* claimed, by two different lenses, get neither — mapping is
+    /// not the question there, so the banner marks the frames instead and
+    /// hands them to the Assign Lens menu that appears for a marked set.
+    private func unclaimedBanner(_ group: ScanPlan.UnclaimedGroup) -> some View {
         HStack(spacing: 10) {
             HStack(spacing: 8) {
-                ForEach(Array(top.codes.enumerated()), id: \.element) { index, code in
+                ForEach(Array(group.codes.enumerated()), id: \.element) { index, code in
                     if index > 0 { EngravedLabel("or", color: Theme.rebate.opacity(0.7)) }
                     BitPatternView(code: code, dotSize: 7)
                 }
             }
-            Text(unclaimedText(top))
+            Text(unclaimedText(group))
                 .font(.system(size: 11))
                 .foregroundStyle(Theme.rebate)
             Spacer()
-            if let code = top.codes.first, top.codes.count == 1 {
+            if group.contested {
+                Button(group.count == 1 ? "Mark This Frame" : "Mark These \(group.count) Frames") {
+                    session.selection = Set(group.frames)
+                }
+                .controlSize(.small)
+                .buttonStyle(.borderedProminent)
+                .tint(Theme.accent)
+                .disabled(session.busyNow)
+            } else if let code = group.codes.first, group.codes.count == 1 {
                 if !lenses.isEmpty {
                     Button("Map to a Lens…") { codeToMap = code }
                         .controlSize(.small)
@@ -553,7 +577,7 @@ struct ScanView: View {
             } else {
                 if !lenses.isEmpty {
                     Menu("Map a Code…") {
-                        ForEach(top.codes, id: \.self) { code in
+                        ForEach(group.codes, id: \.self) { code in
                             Button("Code \(code)…") { codeToMap = code }
                         }
                     }
@@ -562,7 +586,7 @@ struct ScanView: View {
                     .fixedSize()
                 }
                 Menu("Add Lens…") {
-                    ForEach(top.codes, id: \.self) { code in
+                    ForEach(group.codes, id: \.self) { code in
                         Button("With code \(code)…") { addLensCode = code }
                     }
                 }
@@ -576,13 +600,18 @@ struct ScanView: View {
         .background(Theme.rebate.opacity(0.08))
     }
 
-    private func unclaimedText(_ top: (codes: [String], count: Int)) -> String {
-        let subject = "\(top.count) frame\(top.count == 1 ? "" : "s") wear\(top.count == 1 ? "s" : "")"
-        guard top.codes.count > 1 else {
-            return "\(subject) code \(top.codes.first ?? "") — not claimed by any of your lenses yet"
+    private func unclaimedText(_ group: ScanPlan.UnclaimedGroup) -> String {
+        let count = group.count
+        let subject = "\(count) frame\(count == 1 ? "" : "s") wear\(count == 1 ? "s" : "")"
+        let codes = group.codes.joined(separator: " or ")
+        if group.contested {
+            return "\(subject) code \(codes) — \(group.codes.count == 2 ? "both" : "those") codes are mapped, to different lenses, so Uncoded won't pick between them; mark \(count == 1 ? "it" : "them") and assign the lens you actually used"
         }
-        let fits = top.codes.count == 2 ? "either" : "any of them"
-        return "\(subject) code \(top.codes.joined(separator: " or ")) — the camera's lens name fits \(fits), so Uncoded won't guess; map the one you engraved"
+        guard group.codes.count > 1 else {
+            return "\(subject) code \(codes) — not claimed by any of your lenses yet"
+        }
+        let fits = group.codes.count == 2 ? "either" : "any of them"
+        return "\(subject) code \(codes) — the camera's lens name fits \(fits), so Uncoded won't guess; map the one you engraved"
     }
 
     /// Grease-pencil action bar for the marked frames.
@@ -1053,9 +1082,10 @@ private struct FrameCell: View {
                             .foregroundStyle(Theme.faint)
                     } else if file.codeCandidates.count > 1 {
                         // Coded, but the name fits several codes and the file
-                        // records none of them. Say so rather than read as
-                        // uncoded; the tooltip names the candidates.
-                        Text("\(file.codeCandidates.count) possible codes — none mapped")
+                        // records none of them. Say that much and no more —
+                        // whether those codes are mapped is the banner's story,
+                        // and both endings leave this frame unrouted.
+                        Text("\(file.codeCandidates.count) possible codes — Uncoded won't guess")
                             .font(.system(size: 9))
                             .foregroundStyle(Theme.faint)
                     } else {
@@ -1101,7 +1131,7 @@ private struct FrameCell: View {
             lines.append("""
             the camera's lens name fits all of these and the file records none \
             of them, so Uncoded won't guess — right-click to map the code you \
-            actually engraved.
+            actually engraved, or to assign this frame its lens by hand.
             """)
         }
         if let lens = resolution.lens {
