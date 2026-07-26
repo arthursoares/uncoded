@@ -747,4 +747,100 @@ final class TIFFWriterTests: XCTestCase {
         XCTAssertTrue(properties.allSatisfy { !$0.1.isEmpty })
     }
 
+    // MARK: - exiftool gate
+
+    func testExiftoolValidateFindsNoNewProblems() throws {
+        // Skipped cleanly when the tool isn't installed, like the
+        // UNCODED_TEST_DNG reader test.
+        guard let tool = Self.exiftoolPath() else { throw XCTSkip("exiftool is not on PATH") }
+        let url = try writeTemp(makeTIFF(xmp: sampleXMP).data)
+
+        let before = try Self.validationWarnings(tool, url)
+        _ = try TIFFWriter.apply(voigtlander, to: url)
+        let after = try Self.validationWarnings(tool, url)
+
+        XCTAssertTrue(after.subtracting(before).isEmpty,
+                      "the write introduced validation problems: \(after.subtracting(before))")
+        // And exiftool must still read back what we wrote — a file it validates
+        // but cannot parse would pass the check above for the wrong reason.
+        let readout = try Self.exiftool(tool, ["-s3", "-XMP-aux:LensInfo", "-XMP-crs:LensProfileDigest",
+                                              "-ExifIFD:LensModel", url.path])
+        XCTAssertTrue(readout.contains("35mm f/2"), readout)
+        XCTAssertTrue(readout.contains("03CBD374CCB89A292AD832BB830E440F"), readout)
+        XCTAssertTrue(readout.contains("Voigtlander VM 35mm f/2 Ultron Aspherical"), readout)
+    }
+
+    /// The same gate as the reader's real-file test, plus exiftool: point
+    /// UNCODED_TEST_DNG at a copy of a real M11 frame and the whole fix is
+    /// validated and read back with the tool Lightroom users would use.
+    func testRealFileWriteIsExiftoolCleanAndReadsBack() throws {
+        // The scheme forwards the variable unconditionally, so "unset" arrives
+        // as an empty string rather than as a missing key.
+        guard let source = ProcessInfo.processInfo.environment["UNCODED_TEST_DNG"],
+              !source.isEmpty
+        else { throw XCTSkip("set UNCODED_TEST_DNG to a real DNG to run this") }
+        guard let tool = Self.exiftoolPath() else { throw XCTSkip("exiftool is not on PATH") }
+
+        let url = try writeTemp(try Data(contentsOf: URL(fileURLWithPath: source)))
+        let before = try Self.validationWarnings(tool, url)
+        let journal = try TIFFWriter.apply(voigtlander, to: url)
+        let after = try Self.validationWarnings(tool, url)
+        XCTAssertTrue(after.subtracting(before).isEmpty,
+                      "the write introduced validation problems: \(after.subtracting(before))")
+
+        let readout = try Self.exiftool(tool, ["-a", "-G1", "-s", "-m",
+                                              "-LensInfo", "-Lens", "-LensModel", "-LensMake",
+                                              "-LensProfileName", "-LensProfileDigest",
+                                              "-LensProfileFilename", "-LensProfileSetup", url.path])
+        for expected in ["35mm f/2", "Voigtlander VM 35mm f/2 Ultron Aspherical",
+                         "03CBD374CCB89A292AD832BB830E440F", "Custom"] {
+            XCTAssertTrue(readout.contains(expected), "missing \(expected) in:\n\(readout)")
+        }
+        XCTAssertTrue(readout.contains("XMP-aux]       LensInfo"),
+                      "XMP-aux:LensInfo must be written too:\n\(readout)")
+
+        try TIFFWriter.revert(journal)
+        XCTAssertEqual(try Data(contentsOf: url), try Data(contentsOf: URL(fileURLWithPath: source)))
+    }
+
+    private static func exiftoolPath() -> String? {
+        let fm = FileManager.default
+        let fromPath = (ProcessInfo.processInfo.environment["PATH"] ?? "")
+            .split(separator: ":").map { "\($0)/exiftool" }
+        for candidate in fromPath + ["/opt/homebrew/bin/exiftool", "/usr/local/bin/exiftool", "/usr/bin/exiftool"]
+        where fm.isExecutableFile(atPath: candidate) {
+            return candidate
+        }
+        return nil
+    }
+
+    private static func exiftool(_ tool: String, _ arguments: [String]) throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: tool)
+        process.arguments = arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        // Drained before waiting: a full pipe would deadlock the child.
+        let output = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return String(data: output, encoding: .utf8) ?? ""
+    }
+
+    /// Every complaint exiftool has about a file, as a set — the synthetic
+    /// fixture is not a real raw, so what matters is that the write adds none.
+    /// The `Validate` tag itself is a count, and counts move for uninteresting
+    /// reasons (a warning that repeats), so only the warnings are compared.
+    private static func validationWarnings(_ tool: String, _ url: URL) throws -> Set<String> {
+        let output = try exiftool(tool, ["-validate", "-warning", "-error", "-a", "-s", "-G1", url.path])
+        var problems = Set<String>()
+        for line in output.split(separator: "\n") {
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let tag = line[..<colon]
+            guard tag.contains("Warning") || tag.contains("Error") else { continue }
+            problems.insert(line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces))
+        }
+        return problems
+    }
 }
