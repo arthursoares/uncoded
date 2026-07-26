@@ -66,8 +66,10 @@ struct TIFFReader {
     }
 
     /// Opens a DNG memory-mapped and extracts its lens metadata.
+    /// `.mappedIfSafe` and not `.alwaysMapped`: a file on a card that gets
+    /// pulled mid-scan would SIGBUS us on the next page fault.
     static func read(url: URL) throws -> LensMetadata {
-        let data = try Data(contentsOf: url, options: .alwaysMapped)
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
         return try TIFFReader(data: data).lensMetadata()
     }
 
@@ -103,7 +105,9 @@ struct TIFFReader {
             throw ReadError.truncated
         }
         let count = Int(countRaw)
-        guard offset + 2 + count * 12 <= data.count else { throw ReadError.truncated }
+        // The 4-byte next-IFD pointer is part of the IFD: validate it here so
+        // consumers (TIFFWriter's rebuild) can read the whole extent safely.
+        guard offset >= 0, offset + 2 + count * 12 + 4 <= data.count else { throw ReadError.truncated }
 
         var entries: [UInt16: Entry] = [:]
         for i in 0..<count {
@@ -117,7 +121,8 @@ struct TIFFReader {
         return entries
     }
 
-    private static let typeSizes: [UInt16: Int] = [
+    /// TIFF type → bytes per component (also used by TIFFWriter).
+    static let typeSizes: [UInt16: Int] = [
         1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8,
     ]
 
