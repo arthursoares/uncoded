@@ -273,7 +273,11 @@ struct TIFFWriter {
         fileprivate let writer: TIFFWriter
         fileprivate let url: URL
 
-        func commit() throws { try writer.commit(to: url) }
+        /// The journal goes back into the commit as the record of what the plan
+        /// was made against — its patch bytes and content sample are copies taken
+        /// at planning time, so they still describe the file as it was then even
+        /// if the file itself has moved on.
+        func commit() throws { try writer.commit(to: url, verifying: journal) }
     }
 
     /// Plans the write and returns it with its journal, unapplied.
@@ -929,14 +933,51 @@ struct TIFFWriter {
         return nil
     }
 
+    /// Proves the file still holds the bytes the plan was made against, at the
+    /// last possible moment before the first write.
+    ///
+    /// Matching lengths are not enough. Planning happens well before the write:
+    /// in between, Uncoded copies the file to `.bak` and saves an undo record,
+    /// and that window is wide enough for Lightroom to write its own metadata
+    /// back — an in-place edit, or an atomic replace, either of which can leave
+    /// the length untouched. Patching planned offsets into bytes that have moved
+    /// would corrupt them, and the journal would afterwards "revert" the file to
+    /// bytes that were never there, throwing away the other writer's work.
+    ///
+    /// Only the regions this write will overwrite, plus the journal's sample of
+    /// untouched content, are re-read — a few KB of what may be a 100 MB raw.
+    /// The mapped copy `data` is no use for this: an in-place edit shows through
+    /// a mapping, so the "original" bytes it holds may already be the new ones.
+    private func verifyPlannedBytes(_ journal: WriteJournal, using handle: FileHandle) throws {
+        func bytes(at offset: Int, _ count: Int) throws -> Data? {
+            try handle.seek(toOffset: UInt64(offset))
+            return try handle.read(upToCount: count)
+        }
+        for patch in journal.patches {
+            guard try bytes(at: patch.offset, patch.original.count) == patch.original else {
+                throw TIFFWriteError.fileChangedWhileWriting
+            }
+        }
+        // The sample is what catches an edit that missed every patched region —
+        // develop settings, a rating, GPS.
+        if let sample = journal.sample {
+            guard let slice = try bytes(at: sample.offset, sample.length),
+                  slice.count == sample.length,
+                  WriteJournal.ContentSample.hash(slice) == sample.hash
+            else { throw TIFFWriteError.fileChangedWhileWriting }
+        }
+    }
+
     /// Write ordering is the whole safety story here: a crash or a full disk
     /// between two writes must never leave a pointer or count describing bytes
     /// that aren't on disk. So the appendix lands and is flushed first, then
     /// value bytes, then — last, after another flush — the pointers and counts
     /// that describe them. A half-finished commit is then still a readable file
     /// whose fields all point at real bytes.
-    private func commit(to url: URL) throws {
-        let handle = try FileHandle(forWritingTo: url)
+    private func commit(to url: URL, verifying journal: WriteJournal) throws {
+        // Opened for updating, not writing: the verification below has to read
+        // through the same descriptor it is about to write through.
+        let handle = try FileHandle(forUpdating: url)
         defer { try? handle.close() }
         // Every appendix offset was computed against the length we mapped, and
         // the appendix is written at the current end of file: if anything grew
@@ -944,7 +985,11 @@ struct TIFFWriter {
         guard try handle.seekToEnd() == UInt64(originalLength) else {
             throw TIFFWriteError.fileChangedWhileWriting
         }
+        try verifyPlannedBytes(journal, using: handle)
         if !appendix.isEmpty {
+            // Seek explicitly: verifying read all over the file, so the cursor is
+            // wherever that left it, not at end-of-file.
+            try handle.seek(toOffset: UInt64(originalLength))
             try handle.write(contentsOf: appendix)
             try handle.synchronize()
         }

@@ -240,6 +240,75 @@ final class TIFFWriterTests: XCTestCase {
         XCTAssertNoThrow(try XMLDocument(data: Data(text.utf8), options: []))
     }
 
+    // MARK: - The window between planning and committing
+
+    /// The fixture plus enough trailing bytes to stand in for image data, so the
+    /// journal has somewhere clear of the patches to take its content sample —
+    /// which is what a real 50 MB frame gives it.
+    private var fixtureWithImageData: Data {
+        makeTIFF(xmp: sampleXMP).data + Data(repeating: 0xAB, count: 8192)
+    }
+
+    /// Plans a write against `data`, lets something else change one byte behind
+    /// the plan's back, then commits — and asserts the commit refused, writing
+    /// nothing. `target` picks the byte from the planned journal.
+    private func assertCommitRefusesWhenAByteChanges(
+        in data: Data, at target: (WriteJournal) throws -> Int,
+        file: StaticString = #filePath, line: UInt = #line) throws {
+        let url = try writeTemp(data)
+        let prepared = try TIFFWriter.prepare(voigtlander, to: url)
+
+        // Something else writes the file while Uncoded is between planning and
+        // committing — the window that holds the .bak copy and the journal save.
+        // Lightroom's metadata write-back keeps the length, so the length check
+        // on its own sees nothing wrong.
+        var edited = data
+        edited[try target(prepared.journal)] ^= 0xFF
+        XCTAssertEqual(edited.count, data.count, file: file, line: line)
+        try edited.write(to: url)
+
+        XCTAssertThrowsError(try prepared.commit(), file: file, line: line) { error in
+            guard case TIFFWriteError.fileChangedWhileWriting = error else {
+                return XCTFail("expected fileChangedWhileWriting, got \(error)", file: file, line: line)
+            }
+        }
+        XCTAssertEqual(try Data(contentsOf: url), edited,
+                       "a refused commit must leave the other writer's bytes alone",
+                       file: file, line: line)
+    }
+
+    func testCommitRefusesWhenAPatchedRegionChangedSincePlanning() throws {
+        // Patching planned offsets into changed bytes corrupts them, and the
+        // journal would afterwards "revert" to bytes that were never there —
+        // silently discarding whatever the other writer did.
+        try assertCommitRefusesWhenAByteChanges(in: fixtureWithImageData) { journal in
+            try XCTUnwrap(journal.patches.first).offset
+        }
+    }
+
+    func testCommitRefusesWhenOnlyTheSampleWindowChangedSincePlanning() throws {
+        // An edit that misses every patched region — develop settings, a rating,
+        // GPS — is what the journal's content sample is for. Without checking it
+        // the commit would proceed and the journal would claim a pre-write state
+        // that never existed.
+        try assertCommitRefusesWhenAByteChanges(in: fixtureWithImageData) { journal in
+            let sample = try XCTUnwrap(journal.sample, "fixture must carry a content sample")
+            let patched = journal.patches.map { $0.offset..<($0.offset + $0.new.count) }
+            return try XCTUnwrap((sample.offset..<(sample.offset + sample.length))
+                .first { offset in !patched.contains { $0.contains(offset) } },
+                                 "sample window must hold a byte no patch covers")
+        }
+    }
+
+    func testCommitStillSucceedsWhenNothingTouchedTheFile() throws {
+        // The guard must not cost the ordinary case.
+        let url = try writeTemp(makeTIFF(xmp: sampleXMP).data)
+        let prepared = try TIFFWriter.prepare(voigtlander, to: url)
+        XCTAssertNoThrow(try prepared.commit())
+        XCTAssertEqual(try TIFFReader.read(url: url).lensModel,
+                       "Voigtlander VM 35mm f/2 Ultron Aspherical")
+    }
+
     func testRevertRestoresByteIdenticalFile() throws {
         let original = makeTIFF(xmp: sampleXMP).data
         let url = try writeTemp(original)
