@@ -4,7 +4,12 @@ import Foundation
 struct ScannedDNG: Identifiable, Hashable, Sendable {
     let url: URL
     let meta: TIFFReader.LensMetadata
-    let matchedCode: SixBitCode? // borrowed Leica code detected from LensModel
+    /// Borrowed Leica codes the LensModel could name — more than one when the
+    /// camera string doesn't say which generation (see matchCandidates).
+    let codeCandidates: [SixBitCode]
+
+    /// The borrowed code, when the LensModel names exactly one.
+    var matchedCode: SixBitCode? { codeCandidates.count == 1 ? codeCandidates.first : nil }
 
     var id: URL { url }
     var filename: String { url.lastPathComponent }
@@ -33,7 +38,7 @@ enum DNGScanner {
             .compactMap { url in
                 guard let meta = try? TIFFReader.read(url: url) else { return nil }
                 return ScannedDNG(url: url, meta: meta,
-                                  matchedCode: SixBitTable.match(lensModel: meta.lensModel))
+                                  codeCandidates: SixBitTable.matchCandidates(lensModel: meta.lensModel))
             }
     }
 }

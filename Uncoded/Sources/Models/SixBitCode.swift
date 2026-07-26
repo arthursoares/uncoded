@@ -61,20 +61,26 @@ enum SixBitTable {
 
     /// Matches a lens name in either Leica format (the camera writes
     /// "Noctilux-M 1:1.2/50 ASPH.", catalogs "Noctilux-M 50mm f/1.2 ASPH") to
-    /// its table row. The full name decides; a camera string, which omits the
-    /// generation marker, falls back to the name without it.
+    /// its table row, or nil when the name can't name one code.
     static func match(lensModel: String?) -> SixBitCode? {
-        guard let lensModel, let key = LensNameParser.key(of: lensModel) else { return nil }
-        if let row = singleCode(index.byName[key]) { return row }
-        return singleCode(index.byBase[key.base])
+        let candidates = matchCandidates(lensModel: lensModel)
+        return candidates.count == 1 ? candidates.first : nil
     }
 
-    /// The first candidate only when they all wear the same code: a name
-    /// spanning two codes (Elmarit-M 28/2.8 III is 000011, IV is 011011) is
-    /// unresolvable, and guessing would fix photos as the wrong lens.
-    private static func singleCode(_ rows: [SixBitCode]?) -> SixBitCode? {
-        guard let rows, Set(rows.map(\.code)).count == 1 else { return nil }
-        return rows.first
+    /// The codes a lens name could mean, one row per code. Usually one; more
+    /// when generations of the same lens wear different codes (Elmarit-M
+    /// 28/2.8 III is 000011, IV is 011011) and the name — as camera strings do
+    /// — carries no generation marker. Only the user knows which one is
+    /// engraved, so callers must not guess.
+    static func matchCandidates(lensModel: String?) -> [SixBitCode] {
+        guard let lensModel, let key = LensNameParser.key(of: lensModel) else { return [] }
+        // A name with a generation marker can name its exact row; without one
+        // only the base can decide, and going through byName first would let
+        // an unmarked row win beside marked generations.
+        let rows = key.generation.isEmpty ? index.byBase[key.base] : index.byName[key] ?? index.byBase[key.base]
+        guard let rows else { return [] }
+        var seen = Set<String>()
+        return rows.filter { seen.insert($0.code).inserted }
     }
 
     /// Unique codes ordered by how plausible a borrow they are for the given

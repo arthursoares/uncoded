@@ -65,7 +65,37 @@ final class LensNameParserTests: XCTestCase {
     }
 
     func testThirdPartyLensDoesNotMatchLeicaTable() {
-        XCTAssertNil(SixBitTable.match(lensModel: "Voigtlander VM 35mm f/2 Ultron Aspherical"))
+        // Even when the specs line up with a Leica lens exactly, a third-party
+        // name must never resolve to a code — that's what mappings are for.
+        for name in ["Voigtlander VM 35mm f/2 Ultron Aspherical",
+                     "Voigtlander VM 50mm f/1.5 Nokton Vintage Line",
+                     "Zeiss Biogon T* 2/35 ZM",
+                     "7Artisans 50mm f/1.1"] {
+            XCTAssertNil(SixBitTable.match(lensModel: name), name)
+            XCTAssertEqual(SixBitTable.matchCandidates(lensModel: name).count, 0, name)
+        }
+    }
+
+    func testAmbiguousNameReportsItsCandidatesInsteadOfGuessing() {
+        // Two Elmarit-M 28/2.8 generations wear different codes and the camera
+        // writes no generation marker: candidates, not a guess.
+        let candidates = SixBitTable.matchCandidates(lensModel: "Elmarit-M 1:2.8/28")
+        XCTAssertEqual(Set(candidates.map(\.code)), ["000011", "011011"])
+        XCTAssertNil(SixBitTable.match(lensModel: "Elmarit-M 1:2.8/28"))
+
+        // A name that does carry the marker names one code.
+        XCTAssertEqual(SixBitTable.match(lensModel: "Elmarit-M 28mm f/2.8 (IV)")?.code, "011011")
+        XCTAssertEqual(SixBitTable.matchCandidates(lensModel: "Summicron-M 1:2/35 ASPH.").count, 1)
+    }
+
+    func testGenerationlessNameNeverSkipsTheAmbiguityCheck() {
+        // A name without a generation marker must be answered from the base
+        // group, so it can't slip past the check by hitting an exact row that
+        // happens to carry no marker either.
+        for name in ["Elmarit-M 28mm f/2.8", "Summicron-M 50mm f/2", "Summicron-M 1:2/50"] {
+            XCTAssertNil(SixBitTable.match(lensModel: name), name)
+            XCTAssertGreaterThan(SixBitTable.matchCandidates(lensModel: name).count, 1, name)
+        }
     }
 
     func testRankedCodesSuggestMatchingSpecsFirst() {

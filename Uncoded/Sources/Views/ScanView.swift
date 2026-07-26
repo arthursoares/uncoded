@@ -265,7 +265,11 @@ struct ScanView: View {
         if let manual = session.overrides[file.url] {
             return Resolution(lens: manual, isManual: true)
         }
-        guard let code = file.matchedCode?.code, let lens = mappingByCode[code]?.lens else {
+        // When the camera string can't say which generation it is, the code the
+        // user mapped is the one they engraved — but only if exactly one of the
+        // candidates is claimed.
+        let claimed = file.codeCandidates.filter { mappingByCode[$0.code] != nil }
+        guard claimed.count == 1, let lens = mappingByCode[claimed[0].code]?.lens else {
             return Resolution(lens: nil, isManual: false)
         }
         return Resolution(lens: lens, isManual: false)
@@ -327,7 +331,7 @@ struct ScanView: View {
         let updated: ScannedDNG? = await Task.detached(priority: .userInitiated) {
             guard let meta = try? TIFFReader.read(url: url) else { return nil }
             return ScannedDNG(url: url, meta: meta,
-                              matchedCode: SixBitTable.match(lensModel: meta.lensModel))
+                              codeCandidates: SixBitTable.matchCandidates(lensModel: meta.lensModel))
         }.value
         guard let updated, let index = session.results.firstIndex(where: { $0.url == url }) else { return }
         session.results[index] = updated
