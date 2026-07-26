@@ -90,9 +90,10 @@ struct ScanView: View {
     /// Frame numbers stay tied to the scan order even when the grid is
     /// filtered down to the failures.
     private var displayed: [(number: Int, file: ScannedDNG)] {
-        session.results.enumerated()
-            .map { (number: $0.offset + 1, file: $0.element) }
-            .filter { !session.showFailuresOnly || session.fixState[$0.file.url]?.isFailure == true }
+        let all = session.results.enumerated().map { (number: $0.offset + 1, file: $0.element) }
+        // With no failures left there is no chip to switch the filter back off.
+        guard session.showFailuresOnly, failureCount > 0 else { return all }
+        return all.filter { session.fixState[$0.file.url]?.isFailure == true }
     }
 
     var body: some View {
