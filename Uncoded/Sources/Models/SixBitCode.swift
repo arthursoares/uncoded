@@ -9,9 +9,6 @@ struct SixBitCode: Codable, Identifiable, Hashable, Sendable {
 
     var id: String { code + lensName }
 
-    /// The code as the six pit fields on the bayonet flange.
-    var bits: [Bool] { code.map { $0 == "1" } }
-
     /// The table lists all 64 code indexes; the unused ones are "N/A"
     /// placeholders, not lenses, and nothing can be coded as one.
     var isLens: Bool { lensName.caseInsensitiveCompare("N/A") != .orderedSame }
