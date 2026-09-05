@@ -340,6 +340,60 @@ final class TIFFWriterTests: XCTestCase {
                        "a refused revert must not touch the file")
     }
 
+    func testRevertRefusesSameLengthEditInsideAppendedXMPAfterJournalRoundTripAndRename() throws {
+        let original = makeTIFF(xmp: packet).data
+        let url = try writeTemp(original)
+        let journal = try TIFFWriter.apply(voigtlander, to: url)
+        let decoded = try JSONDecoder().decode(WriteJournal.self, from: JSONEncoder().encode(journal))
+        let renamed = try writeTemp(Data(contentsOf: url))
+        try FileManager.default.removeItem(at: url)
+        let relocated = decoded.relocated(to: renamed)
+        var edited = try Data(contentsOf: renamed)
+        XCTAssertTrue(relocated.describesWrittenBytes(edited))
+        let range = try XCTUnwrap(edited.range(of: Data(voigtlander.profileDigest.utf8),
+                                              in: journal.originalLength..<edited.count))
+        edited[range.lowerBound] = edited[range.lowerBound] == 65 ? 66 : 65
+        try edited.write(to: renamed)
+
+        XCTAssertEqual(edited.count, journal.writtenLength)
+        XCTAssertFalse(relocated.describesWrittenBytes(edited))
+        XCTAssertTrue(relocated.audit(edited).anyForeign)
+        XCTAssertThrowsError(try TIFFWriter.revert(relocated))
+        XCTAssertEqual(try Data(contentsOf: renamed), edited)
+    }
+
+    func testMalformedAppendixRecordIsRefusedWithoutChangingTheFile() throws {
+        let url = try writeTemp(makeTIFF(xmp: packet).data)
+        let journal = try TIFFWriter.apply(voigtlander, to: url)
+        let fixed = try Data(contentsOf: url)
+        var truncated = journal
+        truncated.appendix = Data(try XCTUnwrap(journal.appendix).dropLast())
+        let overflow = WriteJournal(filePath: url.path, date: journal.date,
+                                    originalLength: Int.max, patches: journal.patches,
+                                    appendedBytes: 1, appendix: Data([0]))
+        for malformed in [truncated, overflow] {
+            XCTAssertTrue(malformed.audit(fixed).anyForeign)
+            XCTAssertFalse(malformed.describesWrittenBytes(fixed))
+            XCTAssertThrowsError(try TIFFWriter.revert(malformed))
+            XCTAssertEqual(try Data(contentsOf: url), fixed)
+        }
+    }
+
+    func testLegacyJournalWithoutAppendixStillReverts() throws {
+        let original = makeTIFF(xmp: sampleXMP).data
+        let url = try writeTemp(original)
+        let short = LensWrite(lensMake: "Zeiss", lensModel: "Biogon", focalMM: nil,
+                              apertureF: nil, profileName: "", profileFilename: "", profileDigest: "")
+        let journal = try TIFFWriter.apply(short, to: url)
+        XCTAssertEqual(journal.appendedBytes, 0)
+        let legacy = WriteJournal(filePath: url.path, date: journal.date,
+                                  originalLength: journal.originalLength,
+                                  patches: journal.patches, appendedBytes: 0)
+        let decoded = try JSONDecoder().decode(WriteJournal.self, from: JSONEncoder().encode(legacy))
+        try TIFFWriter.revert(decoded)
+        XCTAssertEqual(try Data(contentsOf: url), original)
+    }
+
     func testRevertRefusesWhenFileLengthChanged() throws {
         let url = try writeTemp(makeTIFF(xmp: sampleXMP).data)
         let journal = try TIFFWriter.apply(voigtlander, to: url)

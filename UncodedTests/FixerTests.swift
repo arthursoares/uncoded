@@ -239,10 +239,13 @@ final class FixerTests: XCTestCase {
         let prepared = try TIFFWriter.prepare(write, to: file)
         XCTAssertGreaterThan(prepared.journal.appendedBytes, 0, "fixture must append")
         let record = try store.save(prepared.journal)
-        let handle = try FileHandle(forWritingTo: file)
-        try handle.seekToEnd()
-        try handle.write(contentsOf: Data(repeating: 0, count: prepared.journal.appendedBytes))
-        try handle.close()
+        try prepared.commit()
+        var interrupted = try Data(contentsOf: file)
+        for patch in prepared.journal.patches {
+            interrupted.replaceSubrange(patch.offset..<(patch.offset + patch.original.count),
+                                        with: patch.original)
+        }
+        try interrupted.write(to: file)
         return record
     }
 
@@ -276,10 +279,14 @@ final class FixerTests: XCTestCase {
         let prepared = try TIFFWriter.prepare(write, to: file)
         XCTAssertGreaterThan(prepared.journal.appendedBytes, 1, "fixture must append")
         let record = try store.save(prepared.journal)
-        let handle = try FileHandle(forWritingTo: file)
-        try handle.seekToEnd()
-        try handle.write(contentsOf: Data(repeating: 0, count: prepared.journal.appendedBytes / 2))
-        try handle.close()
+        try prepared.commit()
+        var interrupted = try Data(contentsOf: file)
+        for patch in prepared.journal.patches {
+            interrupted.replaceSubrange(patch.offset..<(patch.offset + patch.original.count),
+                                        with: patch.original)
+        }
+        try interrupted.prefix(prepared.journal.originalLength + prepared.journal.appendedBytes / 2)
+            .write(to: file)
         return record
     }
 
@@ -339,6 +346,53 @@ final class FixerTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: file), edited, "a refused revert touches nothing")
     }
 
+    func testForeignPartialAppendixIsRefusedWithoutDeletingTheJournal() throws {
+        let file = tempDir.appendingPathComponent("photo.dng")
+        try makeTIFF().write(to: file)
+        let record = try simulatePartialAppendix(file)
+        var edited = try Data(contentsOf: file)
+        edited[record.journal.originalLength] ^= 0xFF
+        try edited.write(to: file)
+
+        XCTAssertEqual(store.resolve(record), .unverified)
+        XCTAssertThrowsError(try fixer.revert(file: file))
+        XCTAssertEqual(try Data(contentsOf: file), edited)
+        XCTAssertEqual(journalFiles().count, 1)
+    }
+
+    func testForeignCompleteAppendixIsRefusedDuringInterruptedRecovery() throws {
+        let file = tempDir.appendingPathComponent("photo.dng")
+        try makeTIFF().write(to: file)
+        let record = try simulateInterruptedPatches(file, applying: 1)
+        var edited = try Data(contentsOf: file)
+        edited[record.journal.originalLength] ^= 0xFF
+        try edited.write(to: file)
+
+        XCTAssertEqual(store.resolve(record), .unverified)
+        XCTAssertThrowsError(try fixer.revert(file: file))
+        XCTAssertEqual(try Data(contentsOf: file), edited)
+        XCTAssertEqual(journalFiles().count, 1)
+    }
+
+    func testLegacyPendingJournalDoesNotRecoverAnUnverifiablePartialAppendix() throws {
+        let file = tempDir.appendingPathComponent("photo.dng")
+        try makeTIFF().write(to: file)
+        let record = try simulatePartialAppendix(file)
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(record.journal))
+                                 as? [String: Any])
+        json.removeValue(forKey: "appendix")
+        let encoded = try JSONSerialization.data(withJSONObject: json)
+        try encoded.write(to: record.url)
+        let legacy = JournalRecord(journal: try JSONDecoder().decode(WriteJournal.self, from: encoded),
+                                   url: record.url)
+        let interrupted = try Data(contentsOf: file)
+
+        XCTAssertEqual(store.resolve(legacy), .unverified)
+        XCTAssertThrowsError(try fixer.revert(file: file))
+        XCTAssertEqual(try Data(contentsOf: file), interrupted)
+        XCTAssertEqual(journalFiles().count, 1)
+    }
+
     // MARK: - Self-healing profile digest
 
     func testFixResolvesAnEmptyDigestFromTheInstalledProfile() throws {
@@ -352,14 +406,17 @@ final class FixerTests: XCTestCase {
         stale.profileDigest = ""
         stale.profileFilename = "Leica Camera AG (Voigtlander VM 35mm f2 Ultron) - RAW.lcp"
 
-        var asked: [String] = []
+        let asked = expectation(description: "looks up the missing digest")
+        asked.assertForOverFulfill = true
+        let expectedFilename = stale.profileFilename
         let healing = Fixer(store: store, profileDigest: { filename in
-            asked.append(filename)
-            return filename == stale.profileFilename ? "03CBD374CCB89A292AD832BB830E440F" : nil
+            XCTAssertEqual(filename, expectedFilename)
+            asked.fulfill()
+            return filename == expectedFilename ? "03CBD374CCB89A292AD832BB830E440F" : nil
         })
         try healing.fix(file: file, with: stale, keepBak: false)
 
-        XCTAssertEqual(asked, [stale.profileFilename])
+        wait(for: [asked], timeout: 0)
         XCTAssertEqual(try TIFFReader.read(url: file).profileDigest,
                        "03CBD374CCB89A292AD832BB830E440F",
                        "the written packet must carry the installed profile's digest")
@@ -371,14 +428,12 @@ final class FixerTests: XCTestCase {
         let file = tempDir.appendingPathComponent("photo.dng")
         try makeTIFF().write(to: file)
 
-        var asked = false
         let healing = Fixer(store: store, profileDigest: { _ in
-            asked = true
+            XCTFail("a lens that has a digest is not looked up")
             return "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         })
         try healing.fix(file: file, with: write, keepBak: false)
 
-        XCTAssertFalse(asked, "a lens that has a digest is not looked up")
         XCTAssertEqual(try TIFFReader.read(url: file).profileDigest, write.profileDigest)
     }
 
@@ -408,14 +463,13 @@ final class FixerTests: XCTestCase {
         XCTAssertGreaterThan(prepared.journal.patches.count, applied,
                              "fixture must have more patches than we apply")
         let record = try store.save(prepared.journal)
-        let handle = try FileHandle(forWritingTo: file)
-        try handle.seekToEnd()
-        try handle.write(contentsOf: Data(repeating: 0, count: prepared.journal.appendedBytes))
-        for patch in prepared.journal.patches.prefix(applied) {
-            try handle.seek(toOffset: UInt64(patch.offset))
-            try handle.write(contentsOf: patch.new)
+        try prepared.commit()
+        var interrupted = try Data(contentsOf: file)
+        for patch in prepared.journal.patches.dropFirst(applied) {
+            interrupted.replaceSubrange(patch.offset..<(patch.offset + patch.original.count),
+                                        with: patch.original)
         }
-        try handle.close()
+        try interrupted.write(to: file)
         return record
     }
 
@@ -723,7 +777,7 @@ final class FixerTests: XCTestCase {
 
     // MARK: - Format compatibility
 
-    func testV1JournalStillDecodesAndReverts() throws {
+    func testV1JournalWithUnverifiableAppendixStillDecodesButRefusesRevert() throws {
         let file = tempDir.appendingPathComponent("photo.dng")
         let original = makeTIFF()
         try original.write(to: file)
@@ -751,8 +805,13 @@ final class FixerTests: XCTestCase {
         XCTAssertEqual(decoded?.journal.fileName, "photo.dng")
         XCTAssertEqual(store.fixedPaths(), [file.path])
 
-        try fixer.revert(file: file)
-        XCTAssertEqual(try Data(contentsOf: file), original)
+        XCTAssertGreaterThan(journal.appendedBytes, 0)
+        let fixed = try Data(contentsOf: file)
+        XCTAssertThrowsError(try fixer.revert(file: file)) { error in
+            XCTAssertTrue(error.localizedDescription.contains("older undo record"))
+        }
+        XCTAssertEqual(try Data(contentsOf: file), fixed)
+        XCTAssertEqual(journalFiles().count, 1)
     }
 
     // MARK: - The scan settles (runs only when UNCODED_TEST_DNG points at a DNG)

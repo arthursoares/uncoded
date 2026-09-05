@@ -1,12 +1,17 @@
 import SwiftUI
 import SwiftData
 
+struct CodeSelection: Identifiable {
+    let code: String
+    var id: String { code }
+}
+
 /// Every 6-bit code a Leica M lens wears, drawn as its flange pit pattern,
 /// with the user's mapping (borrowed code -> real lens) shown in place.
 struct CodesView: View {
     @Query private var mappings: [CodeMapping]
     @State private var search = ""
-    @State private var codeToMap: String?
+    @State private var codeToMap: CodeSelection?
 
     private var mappingByCode: [String: CodeMapping] {
         Dictionary(mappings.map { ($0.code, $0) }, uniquingKeysWith: { a, _ in a })
@@ -28,7 +33,7 @@ struct CodesView: View {
                     CodeCard(code: code,
                              entries: SixBitTable.byCode[code] ?? [],
                              mapping: mappingByCode[code])
-                        .onTapGesture { codeToMap = code }
+                        .onTapGesture { codeToMap = CodeSelection(code: code) }
                 }
             }
             .padding(16)
@@ -36,14 +41,10 @@ struct CodesView: View {
         .background(Theme.bg)
         .searchable(text: $search, prompt: "Code, lens, or product number")
         .navigationTitle("6-Bit Codes")
-        .sheet(item: $codeToMap) { code in
-            MapCodeSheet(code: code, existing: mappingByCode[code])
+        .sheet(item: $codeToMap) { selection in
+            MapCodeSheet(code: selection.code, existing: mappingByCode[selection.code])
         }
     }
-}
-
-extension String: @retroactive Identifiable {
-    public var id: String { self }
 }
 
 private struct CodeCard: View {

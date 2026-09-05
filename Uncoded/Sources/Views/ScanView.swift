@@ -18,8 +18,8 @@ struct ScanView: View {
     @State private var fixScope = FixScope.all
     @State private var pendingRevert: ScannedDNG?
     @State private var confirmRevertMarked = false
-    @State private var addLensCode: String?
-    @State private var codeToMap: String?
+    @State private var addLensCode: CodeSelection?
+    @State private var codeToMap: CodeSelection?
 
     private enum FixScope { case all, marked }
 
@@ -118,14 +118,8 @@ struct ScanView: View {
             }
         }
 
-        /// Frames that resolve to a lens and still need a write: never fixed,
-        /// a failed write worth retrying (nothing was committed), or an
-        /// already-fixed frame the current fix would not write the same way.
-        ///
-        /// "Already fixed" is a seal *or* a file that claims one of the user's
-        /// lenses under its own steam: a frame fixed by v0.1.x whose journal is
-        /// long gone reads as untouched, and rewriting it is how its empty
-        /// profile digest gets repaired.
+        /// Frames that need a first write, retry, or rewrite because their
+        /// metadata differs from the resolved lens.
         private static func target(file: ScannedDNG, resolution: Resolution,
                                    state: FrameFix?) -> FixTarget? {
             guard let lens = resolution.lens else { return nil }
@@ -136,7 +130,6 @@ struct ScanView: View {
             case nil where !alreadyWritten:
                 return FixTarget(file: file, lens: lens, kind: .first)
             default:
-                // The name alone can't see a v0.1.x fix with an empty digest.
                 guard lens.lensWrite.differs(from: file.meta) else { return nil }
                 return FixTarget(file: file, lens: lens, kind: .refix)
             }
@@ -254,11 +247,12 @@ struct ScanView: View {
         } message: {
             Text(revertMessage)
         }
-        .sheet(item: $addLensCode) { code in
-            AddLensSheet(preselectedCode: code)
+        .sheet(item: $addLensCode) { selection in
+            AddLensSheet(preselectedCode: selection.code)
         }
-        .sheet(item: $codeToMap) { code in
-            MapCodeSheet(code: code, existing: mappings.first { $0.code == code })
+        .sheet(item: $codeToMap) { selection in
+            MapCodeSheet(code: selection.code,
+                         existing: mappings.first { $0.code == selection.code })
         }
     }
 
@@ -402,7 +396,8 @@ struct ScanView: View {
                              onTap: { toggleMark($0) },
                              onAssign: { assignMenu(for: [$0.url]) },
                              onRevert: { if !session.busyNow { pendingRevert = $0 } },
-                             onMapCode: { codeToMap = $0 })
+                             onMapCode: { codeToMap = CodeSelection(code: $0) },
+                             busy: session.busyNow)
             case .list:
                 List(displayed(plan), id: \.file.id) { frame in
                     ScanRow(file: frame.file, resolution: plan.resolution(for: frame.file),
@@ -410,12 +405,14 @@ struct ScanView: View {
                             refixLens: plan.refixLens(for: frame.file))
                         .listRowSeparatorTint(Theme.panelEdge)
                         .contextMenu {
-                            assignMenu(for: [frame.file.url])
-                            if session.fixState[frame.file.url]?.isFixed == true {
-                                Divider()
-                                Button("Revert Fix…") { pendingRevert = frame.file }
-                                    .disabled(session.busyNow)
-                            }
+                            ScanFrameContextMenu(
+                                file: frame.file,
+                                resolution: plan.resolution(for: frame.file),
+                                fix: session.fixState[frame.file.url],
+                                busy: session.busyNow,
+                                assignMenu: assignMenu(for: [frame.file.url]),
+                                onRevert: { pendingRevert = frame.file },
+                                onMapCode: { codeToMap = CodeSelection(code: $0) })
                         }
                 }
                 .scrollContentBackground(.hidden)
@@ -567,10 +564,10 @@ struct ScanView: View {
                 .disabled(session.busyNow)
             } else if let code = group.codes.first, group.codes.count == 1 {
                 if !lenses.isEmpty {
-                    Button("Map to a Lens…") { codeToMap = code }
+                    Button("Map to a Lens…") { codeToMap = CodeSelection(code: code) }
                         .controlSize(.small)
                 }
-                Button("Add Lens…") { addLensCode = code }
+                Button("Add Lens…") { addLensCode = CodeSelection(code: code) }
                     .controlSize(.small)
                     .buttonStyle(.borderedProminent)
                     .tint(Theme.accent)
@@ -578,7 +575,9 @@ struct ScanView: View {
                 if !lenses.isEmpty {
                     Menu("Map a Code…") {
                         ForEach(group.codes, id: \.self) { code in
-                            Button("Code \(code)…") { codeToMap = code }
+                            Button("Code \(code)…") {
+                                codeToMap = CodeSelection(code: code)
+                            }
                         }
                     }
                     .menuStyle(.borderedButton)
@@ -587,7 +586,9 @@ struct ScanView: View {
                 }
                 Menu("Add Lens…") {
                     ForEach(group.codes, id: \.self) { code in
-                        Button("With code \(code)…") { addLensCode = code }
+                        Button("With code \(code)…") {
+                            addLensCode = CodeSelection(code: code)
+                        }
                     }
                 }
                 .menuStyle(.borderedButton)
@@ -711,9 +712,6 @@ struct ScanView: View {
         }
         let refixes = targets.filter { $0.kind == .refix }.count
         if refixes > 0 && refixes < targets.count {
-            // Re-assigned by hand, or fixed by a version that wrote less than
-            // this one does — either way, the file no longer says what a fix
-            // would say.
             lines.append("\(refixes) of them \(refixes == 1 ? "was" : "were") already fixed and will be rewritten: what Uncoded writes now differs from what the file\(refixes == 1 ? "" : "s") already \(refixes == 1 ? "carries" : "carry").")
         }
         let retries = targets.filter { $0.kind == .retry }.count
@@ -856,43 +854,38 @@ struct ScanView: View {
     }
 
     private func scan(_ url: URL) {
-        guard !session.busyNow else { return }
-        session.folder = url
-        session.scanning = true
-        session.results = []
-        session.selection = []
-        session.overrides = [:]
-        session.fixState = [:]
-        session.renamedFrom = [:]
-        session.unreadableCount = 0
-        session.skippedSubfolders = 0
-        session.folderReadable = true
-        session.showFailuresOnly = false
-        session.lastRunSummary = nil
-        Task {
-            let (outcome, seals) = await Task.detached(priority: .userInitiated) {
-                let outcome = DNGScanner.scan(folder: url)
-                // By content, not just by path: a fixed frame Lightroom renamed
-                // on import has no journal at its new name, and matching the
-                // bytes is what keeps its undo reachable.
-                return (outcome, JournalStore.sealedURLs(in: outcome.files.map(\.url)))
-            }.value
-            session.results = outcome.files
-            session.unreadableCount = outcome.unreadable
-            session.skippedSubfolders = outcome.skippedSubfolders
-            session.folderReadable = outcome.folderReadable
-            // Files with a persisted journal were fixed in an earlier session —
-            // restore their FIXED seals so revert stays reachable.
-            for file in outcome.files where seals.sealed.contains(file.url) {
-                session.fixState[file.url] = .fixed(warnings: [])
-            }
-            session.renamedFrom = seals.renamedFrom
-            session.scanning = false
-        }
+        session.scan(url)
     }
 }
 
 // MARK: - Contact sheet
+
+private struct ScanFrameContextMenu<AssignMenu: View>: View {
+    let file: ScannedDNG
+    let resolution: Resolution
+    let fix: FrameFix?
+    let busy: Bool
+    let assignMenu: AssignMenu
+    let onRevert: () -> Void
+    let onMapCode: (String) -> Void
+
+    @ViewBuilder
+    var body: some View {
+        assignMenu
+        if fix?.isFixed == true {
+            Divider()
+            Button("Revert Fix…", action: onRevert)
+                .disabled(busy)
+        } else if resolution.lens == nil, !file.codeCandidates.isEmpty {
+            Divider()
+            ForEach(file.codeCandidates, id: \.code) { candidate in
+                Button("Map Code \(candidate.code) to a Lens…") {
+                    onMapCode(candidate.code)
+                }
+            }
+        }
+    }
+}
 
 /// The scan as a film contact sheet: black frames on a dark ground, with the
 /// filename and code printed beneath each frame like edge markings on the
@@ -908,6 +901,7 @@ private struct ContactSheet<AssignMenu: View>: View {
     @ViewBuilder let onAssign: (ScannedDNG) -> AssignMenu
     let onRevert: (ScannedDNG) -> Void
     let onMapCode: (String) -> Void
+    let busy: Bool
 
     var body: some View {
         ScrollView {
@@ -924,26 +918,154 @@ private struct ContactSheet<AssignMenu: View>: View {
                               selected: isSelected(file))
                         .onTapGesture { onTap(file) }
                         .contextMenu {
-                            onAssign(file)
-                            if fixInfo(file)?.isFixed == true {
-                                Divider()
-                                Button("Revert Fix…") { onRevert(file) }
-                            } else if resolve(file).lens == nil, !file.codeCandidates.isEmpty {
-                                // Every candidate, never a guess: two codes fit
-                                // the name and only the lens itself knows which.
-                                Divider()
-                                ForEach(file.codeCandidates, id: \.code) { candidate in
-                                    Button("Map Code \(candidate.code) to a Lens…") {
-                                        onMapCode(candidate.code)
-                                    }
-                                }
-                            }
+                            ScanFrameContextMenu(
+                                file: file,
+                                resolution: resolve(file),
+                                fix: fixInfo(file),
+                                busy: busy,
+                                assignMenu: onAssign(file),
+                                onRevert: { onRevert(file) },
+                                onMapCode: onMapCode)
                         }
                 }
             }
             .padding(16)
         }
         .background(Color.black.opacity(0.35))
+    }
+}
+
+private enum FrameStatusStyle {
+    case sheet, list
+
+    var lensFontSize: CGFloat { self == .sheet ? 9 : 11 }
+    var messageLineLimit: Int? { self == .sheet ? 4 : nil }
+}
+
+private struct RefixStatus: View {
+    let lens: UserLens?
+    let style: FrameStatusStyle
+
+    var body: some View {
+        if let lens {
+            HStack(spacing: style == .sheet ? 4 : 5) {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .font(.system(size: 8))
+                    .foregroundStyle(Theme.rebate)
+                Text(lens.name)
+                    .font(.system(size: style.lensFontSize, weight: .medium))
+                    .foregroundStyle(Theme.rebate)
+                    .lineLimit(1)
+                EngravedLabel("re-fix", color: Theme.rebate)
+            }
+        }
+    }
+}
+
+private struct FrameStatus: View {
+    let file: ScannedDNG
+    let resolution: Resolution
+    let fix: FrameFix?
+    let refixLens: UserLens?
+    let style: FrameStatusStyle
+
+    private var warnings: [String] { fix?.warnings ?? [] }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: style == .sheet ? 3 : 1) {
+            if style == .list {
+                Text(file.claimedLens ?? "no lens metadata")
+                    .font(.system(size: 11))
+                    .foregroundStyle(file.claimedLens == nil ? Theme.faint : Theme.dim)
+                    .lineLimit(1)
+            }
+
+            switch fix {
+            case .fixed, .revertRefused:
+                HStack(spacing: style == .sheet ? 4 : 5) {
+                    Image(systemName: "checkmark.seal.fill")
+                        .font(.system(size: 8))
+                        .foregroundStyle(Theme.ok)
+                    if style == .sheet {
+                        Text(file.claimedLens ?? "")
+                            .font(.system(size: style.lensFontSize, weight: .medium))
+                            .foregroundStyle(Theme.ok)
+                            .lineLimit(1)
+                    }
+                    EngravedLabel("fixed", color: Theme.ok)
+                    if !warnings.isEmpty {
+                        Image(systemName: "exclamationmark.circle.fill")
+                            .font(.system(size: 8))
+                            .foregroundStyle(Theme.rebate)
+                    }
+                }
+                if !warnings.isEmpty {
+                    detail(warnings.joined(separator: "\n"), color: Theme.rebate)
+                }
+                if case .revertRefused(let message) = fix {
+                    if style == .sheet {
+                        EngravedLabel("revert refused", color: Theme.rebate)
+                        detail(message, color: Theme.rebate)
+                    } else {
+                        HStack(spacing: 5) {
+                            EngravedLabel("revert refused", color: Theme.rebate)
+                            detail(message, color: Theme.rebate)
+                        }
+                    }
+                }
+                RefixStatus(lens: refixLens, style: style)
+
+            case .failed(let message):
+                HStack(spacing: style == .sheet ? 4 : 5) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 8))
+                        .foregroundStyle(Theme.accent)
+                    EngravedLabel("failed", color: Theme.accent)
+                }
+                detail(message, color: Theme.accent)
+
+            case nil:
+                if let lens = resolution.lens {
+                    HStack(spacing: style == .sheet ? 4 : 5) {
+                        Image(systemName: "arrow.turn.down.right")
+                            .font(.system(size: style == .sheet ? 7 : 8))
+                            .foregroundStyle(Theme.ok)
+                        Text(lens.name)
+                            .font(.system(size: style.lensFontSize, weight: .medium))
+                            .foregroundStyle(Theme.ok)
+                            .lineLimit(1)
+                        if resolution.isManual {
+                            EngravedLabel("manual", color: Theme.rebate)
+                        }
+                    }
+                } else if file.matchedCode != nil {
+                    detail(style == .sheet
+                           ? "code not mapped"
+                           : "code not mapped to one of your lenses", color: Theme.faint)
+                } else if file.codeCandidates.count > 1 {
+                    let codes = file.codeCandidates.map(\.code).joined(separator: " or ")
+                    detail(style == .sheet
+                           ? "\(file.codeCandidates.count) possible codes — Uncoded won't guess"
+                           : "code \(codes) — Uncoded won't guess which", color: Theme.faint)
+                } else if style == .sheet {
+                    detail(file.claimedLens ?? "no lens metadata", color: Theme.faint)
+                }
+                RefixStatus(lens: refixLens, style: style)
+            }
+        }
+    }
+
+    private func detail(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(.system(size: detailFontSize))
+            .foregroundStyle(color)
+            .lineLimit(style.messageLineLimit)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var detailFontSize: CGFloat {
+        if case nil = fix, style == .sheet { return 9 }
+        return 10
     }
 }
 
@@ -957,8 +1079,6 @@ private struct FrameCell: View {
     let selected: Bool
 
     @State private var image: NSImage?
-
-    private var warnings: [String] { fix?.warnings ?? [] }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -998,7 +1118,8 @@ private struct FrameCell: View {
                     }
                 }
 
-                status
+                FrameStatus(file: file, resolution: resolution, fix: fix,
+                            refixLens: refixLens, style: .sheet)
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 6)
@@ -1011,112 +1132,6 @@ private struct FrameCell: View {
         .contentShape(Rectangle())
         .help(helpText)
         .task { image = await ThumbnailLoader.thumbnail(for: file.url) }
-    }
-
-    @ViewBuilder
-    private var status: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            switch fix {
-            case .fixed, .revertRefused:
-                HStack(spacing: 4) {
-                    Image(systemName: "checkmark.seal.fill")
-                        .font(.system(size: 8))
-                        .foregroundStyle(Theme.ok)
-                    Text(file.claimedLens ?? "")
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundStyle(Theme.ok)
-                        .lineLimit(1)
-                    EngravedLabel("fixed", color: Theme.ok)
-                    // The write landed; something about the backup beside it
-                    // did not. A tick, not an alarm.
-                    if !warnings.isEmpty {
-                        Image(systemName: "exclamationmark.circle.fill")
-                            .font(.system(size: 8))
-                            .foregroundStyle(Theme.rebate)
-                    }
-                }
-                if !warnings.isEmpty {
-                    Text(warnings.joined(separator: "\n"))
-                        .font(.system(size: 10))
-                        .foregroundStyle(Theme.rebate)
-                        .lineLimit(4)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                if case .revertRefused(let message) = fix {
-                    EngravedLabel("revert refused", color: Theme.rebate)
-                    Text(message)
-                        .font(.system(size: 10))
-                        .foregroundStyle(Theme.rebate)
-                        .lineLimit(4)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                refixRow
-            case .failed(let message):
-                HStack(spacing: 4) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 8))
-                        .foregroundStyle(Theme.accent)
-                    EngravedLabel("failed", color: Theme.accent)
-                }
-                Text(message)
-                    .font(.system(size: 10))
-                    .foregroundStyle(Theme.accent)
-                    .lineLimit(4)
-                    .fixedSize(horizontal: false, vertical: true)
-            case nil:
-                HStack(spacing: 4) {
-                    if let lens = resolution.lens {
-                        Image(systemName: "arrow.turn.down.right")
-                            .font(.system(size: 7))
-                            .foregroundStyle(Theme.ok)
-                        Text(lens.name)
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundStyle(Theme.ok)
-                            .lineLimit(1)
-                        if resolution.isManual {
-                            EngravedLabel("manual", color: Theme.rebate)
-                        }
-                    } else if file.matchedCode != nil {
-                        Text("code not mapped")
-                            .font(.system(size: 9))
-                            .foregroundStyle(Theme.faint)
-                    } else if file.codeCandidates.count > 1 {
-                        // Coded, but the name fits several codes and the file
-                        // records none of them. Say that much and no more —
-                        // whether those codes are mapped is the banner's story,
-                        // and both endings leave this frame unrouted.
-                        Text("\(file.codeCandidates.count) possible codes — Uncoded won't guess")
-                            .font(.system(size: 9))
-                            .foregroundStyle(Theme.faint)
-                    } else {
-                        Text(file.claimedLens ?? "no lens metadata")
-                            .font(.system(size: 9))
-                            .foregroundStyle(Theme.faint)
-                            .lineLimit(1)
-                    }
-                }
-                // A frame Uncoded fixed before its journal was lost has no
-                // seal, so its rewrite has to announce itself here.
-                refixRow
-            }
-        }
-    }
-
-    /// The lens a frame is about to be rewritten to.
-    @ViewBuilder
-    private var refixRow: some View {
-        if let refixLens {
-            HStack(spacing: 4) {
-                Image(systemName: "arrow.triangle.2.circlepath")
-                    .font(.system(size: 8))
-                    .foregroundStyle(Theme.rebate)
-                Text(refixLens.name)
-                    .font(.system(size: 9, weight: .medium))
-                    .foregroundStyle(Theme.rebate)
-                    .lineLimit(1)
-                EngravedLabel("re-fix", color: Theme.rebate)
-            }
-        }
     }
 
     private var helpText: String {
@@ -1168,25 +1183,6 @@ private struct ScanRow: View {
     let fix: FrameFix?
     let refixLens: UserLens?
 
-    private var warnings: [String] { fix?.warnings ?? [] }
-
-    /// The lens a frame is about to be rewritten to.
-    @ViewBuilder
-    private var refixRow: some View {
-        if let refixLens {
-            HStack(spacing: 5) {
-                Image(systemName: "arrow.triangle.2.circlepath")
-                    .font(.system(size: 8))
-                    .foregroundStyle(Theme.rebate)
-                Text(refixLens.name)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(Theme.rebate)
-                    .lineLimit(1)
-                EngravedLabel("re-fix", color: Theme.rebate)
-            }
-        }
-    }
-
     var body: some View {
         HStack(spacing: 14) {
             Text(file.filename)
@@ -1201,78 +1197,8 @@ private struct ScanRow: View {
                 Color.clear.frame(width: 60, height: 7)
             }
 
-            VStack(alignment: .leading, spacing: 1) {
-                Text(file.claimedLens ?? "no lens metadata")
-                    .font(.system(size: 11))
-                    .foregroundStyle(file.claimedLens == nil ? Theme.faint : Theme.dim)
-                    .lineLimit(1)
-
-                switch fix {
-                case .fixed, .revertRefused:
-                    HStack(spacing: 5) {
-                        Image(systemName: "checkmark.seal.fill")
-                            .font(.system(size: 8))
-                            .foregroundStyle(Theme.ok)
-                        EngravedLabel("fixed", color: Theme.ok)
-                        // The write landed; the backup beside it is the worry.
-                        if !warnings.isEmpty {
-                            Image(systemName: "exclamationmark.circle.fill")
-                                .font(.system(size: 8))
-                                .foregroundStyle(Theme.rebate)
-                            Text(warnings.joined(separator: "\n"))
-                                .font(.system(size: 10))
-                                .foregroundStyle(Theme.rebate)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-                    if case .revertRefused(let message) = fix {
-                        HStack(spacing: 5) {
-                            EngravedLabel("revert refused", color: Theme.rebate)
-                            Text(message)
-                                .font(.system(size: 10))
-                                .foregroundStyle(Theme.rebate)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-                    refixRow
-                case .failed(let message):
-                    HStack(spacing: 5) {
-                        EngravedLabel("failed", color: Theme.accent)
-                        Text(message)
-                            .font(.system(size: 10))
-                            .foregroundStyle(Theme.accent)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                case nil:
-                    if let lens = resolution.lens {
-                        HStack(spacing: 5) {
-                            Image(systemName: "arrow.turn.down.right")
-                                .font(.system(size: 8))
-                                .foregroundStyle(Theme.ok)
-                            Text(lens.name)
-                                .font(.system(size: 11, weight: .medium))
-                                .foregroundStyle(Theme.ok)
-                                .lineLimit(1)
-                            if resolution.isManual {
-                                EngravedLabel("manual", color: Theme.rebate)
-                            }
-                        }
-                    } else if file.matchedCode != nil {
-                        Text("code not mapped to one of your lenses")
-                            .font(.system(size: 10))
-                            .foregroundStyle(Theme.faint)
-                    } else if file.codeCandidates.count > 1 {
-                        // The name fits several codes and the file records none
-                        // of them — coded, but not to a code we may pick.
-                        Text("code \(file.codeCandidates.map(\.code).joined(separator: " or ")) — Uncoded won't guess which")
-                            .font(.system(size: 10))
-                            .foregroundStyle(Theme.faint)
-                    }
-                    // A frame fixed before its journal was lost has no seal, so
-                    // its rewrite has to announce itself here.
-                    refixRow
-                }
-            }
+            FrameStatus(file: file, resolution: resolution, fix: fix,
+                        refixLens: refixLens, style: .list)
             Spacer()
         }
         .padding(.vertical, 3)

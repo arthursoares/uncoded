@@ -40,13 +40,6 @@ struct TIFFReader {
         static let lensModel: UInt16 = 0xA434
     }
 
-    private struct Entry {
-        let tag: UInt16
-        let type: UInt16
-        let count: Int
-        let fieldOffset: Int // absolute offset of the 4-byte value/offset field
-    }
-
     private let data: Data
     private let littleEndian: Bool
     private let ifd0Offset: Int
@@ -104,7 +97,7 @@ struct TIFFReader {
 
     // MARK: - IFD parsing
 
-    private func parseIFD(at offset: Int) throws -> [UInt16: Entry] {
+    private func parseIFD(at offset: Int) throws -> [UInt16: TIFFEntry] {
         guard let countRaw = Self.u16(data, at: offset, littleEndian: littleEndian) else {
             throw ReadError.truncated
         }
@@ -113,14 +106,14 @@ struct TIFFReader {
         // consumers (TIFFWriter's rebuild) can read the whole extent safely.
         guard offset >= 0, offset + 2 + count * 12 + 4 <= data.count else { throw ReadError.truncated }
 
-        var entries: [UInt16: Entry] = [:]
+        var entries: [UInt16: TIFFEntry] = [:]
         for i in 0..<count {
             let base = offset + 2 + i * 12
             guard let tag = Self.u16(data, at: base, littleEndian: littleEndian),
                   let type = Self.u16(data, at: base + 2, littleEndian: littleEndian),
                   let entryCount = Self.u32(data, at: base + 4, littleEndian: littleEndian)
             else { throw ReadError.truncated }
-            entries[tag] = Entry(tag: tag, type: type, count: Int(entryCount), fieldOffset: base + 8)
+            entries[tag] = TIFFEntry(type: type, count: Int(entryCount), fieldOffset: base + 8)
         }
         return entries
     }
@@ -131,7 +124,7 @@ struct TIFFReader {
     ]
 
     /// The raw bytes of an entry's value, whether inline or at an offset.
-    private func valueData(_ entry: Entry) -> Data? {
+    private func valueData(_ entry: TIFFEntry) -> Data? {
         let size = (Self.typeSizes[entry.type] ?? 1) * entry.count
         var start = entry.fieldOffset
         if size > 4 {
@@ -142,7 +135,7 @@ struct TIFFReader {
         return data.subdata(in: start..<(start + size))
     }
 
-    private func ascii(_ entry: Entry?) -> String? {
+    private func ascii(_ entry: TIFFEntry?) -> String? {
         guard let entry, let raw = valueData(entry) else { return nil }
         let trimmed = raw.prefix { $0 != 0 }
         guard let s = String(data: trimmed, encoding: .utf8) else { return nil }
@@ -151,7 +144,7 @@ struct TIFFReader {
     }
 
     /// SHORT or LONG scalar value (used for IFD pointers).
-    private func uintValue(_ entry: Entry) -> UInt32? {
+    private func uintValue(_ entry: TIFFEntry) -> UInt32? {
         switch entry.type {
         case 3: return Self.u16(data, at: entry.fieldOffset, littleEndian: littleEndian).map(UInt32.init)
         case 4: return Self.u32(data, at: entry.fieldOffset, littleEndian: littleEndian)
@@ -160,7 +153,7 @@ struct TIFFReader {
     }
 
     /// Renders EXIF LensSpecification (4 rationals) as "50mm f/1.2" or "16-21mm f/4".
-    private func lensSpecString(_ entry: Entry?) -> String? {
+    private func lensSpecString(_ entry: TIFFEntry?) -> String? {
         guard let entry, entry.type == 5, entry.count == 4, let raw = valueData(entry) else { return nil }
         var values: [Double] = []
         for i in 0..<4 {
@@ -190,7 +183,6 @@ struct TIFFReader {
     /// offset of the entry's 4-byte value/offset field; the count field sits
     /// at `fieldOffset - 4`.
     struct TIFFEntry {
-        let tag: UInt16
         let type: UInt16
         let count: Int
         let fieldOffset: Int
@@ -207,17 +199,14 @@ struct TIFFReader {
 
     func structure() throws -> TIFFStructure {
         let ifd0 = try parseIFD(at: ifd0Offset)
-        var exif: [UInt16: Entry] = [:]
+        var exif: [UInt16: TIFFEntry] = [:]
         var exifOffset: Int?
         if let pointer = ifd0[Tag.exifIFD], let offset = uintValue(pointer) {
             exifOffset = Int(offset)
             exif = try parseIFD(at: Int(offset))
         }
-        func convert(_ entries: [UInt16: Entry]) -> [UInt16: TIFFEntry] {
-            entries.mapValues { TIFFEntry(tag: $0.tag, type: $0.type, count: $0.count, fieldOffset: $0.fieldOffset) }
-        }
         return TIFFStructure(littleEndian: littleEndian, ifd0Offset: ifd0Offset,
-                             exifIFDOffset: exifOffset, ifd0: convert(ifd0), exif: convert(exif))
+                             exifIFDOffset: exifOffset, ifd0: ifd0, exif: exif)
     }
 
     // MARK: - Primitive reads
@@ -242,13 +231,8 @@ struct TIFFReader {
     /// Extracts an XMP property in either attribute (crs:X="…") or element
     /// (<crs:X>…</crs:X>) form.
     ///
-    /// The value is XML text, so it comes back unescaped: the writer serializes
-    /// through `XMLDocument`, which turns `&` into `&amp;`, and deliberately
-    /// emits `&#xA;`/`&#xD;`/`&#x9;` for whitespace that attribute-value
-    /// normalization would otherwise eat. Handing that text back raw made a
-    /// lens called "Cooke &amp; Sons" read differently from the one that was
-    /// written — enough for `LensWrite.differs` to flag the frame on every
-    /// scan, for ever, and for the tooltip to print the escapes.
+    /// Decodes XML entities, including whitespace references emitted by the
+    /// writer, so readback compares equal to the original lens values.
     static func xmpValue(_ xmp: String, property: String) -> String? {
         let escaped = NSRegularExpression.escapedPattern(for: property)
         for pattern in [
@@ -270,12 +254,8 @@ struct TIFFReader {
     /// XML text back to the characters it stands for: the five named entities
     /// and numeric character references in both bases.
     ///
-    /// One left-to-right pass, never a series of replacements — decoding
-    /// `&amp;` first and `&lt;` after would turn the escaped text `&amp;lt;`
-    /// into a `<` that was never there. Anything that isn't a reference we
-    /// recognise is left exactly as written: an XMP packet is a file on disk
-    /// like any other, and inventing a character for `&frac12;` would be worse
-    /// than printing it.
+    /// Decodes once from left to right: `&amp;lt;` must become `&lt;`, not `<`.
+    /// Unknown references are preserved verbatim.
     static func unescapedXML(_ text: String) -> String {
         guard text.contains("&") else { return text }
         var out = ""

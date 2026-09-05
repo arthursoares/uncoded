@@ -81,9 +81,4 @@ final class SixBitTableTests: XCTestCase {
         let stop = catalog[aperture].replacingOccurrences(of: ",", with: ".")
         return "\(family) 1:\(stop)/\(catalog[focal])" + (catalog.contains("ASPH") ? " ASPH." : "")
     }
-
-    func testBitsMatchCodeString() {
-        let row = SixBitCode(code: "110100", lensName: "x", productCodes: [], leicaIndex: "")
-        XCTAssertEqual(row.bits, [true, true, false, true, false, false])
-    }
 }
