@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Revert verifies appended metadata as well as in-place patches, refusing
+  same-length edits made after a fix. New journals also verify partial
+  appendix writes before recovering an interrupted fix.
+- Older journals remain readable, but undo refuses when appended bytes
+  cannot be verified. The DNG and its journal are preserved; a verified
+  original backup can be restored manually.
+- Starting a new scan prevents an older scan from replacing its results.
+- Grid and list views share frame status and context-menu actions, including
+  code mapping. Removed duplicate TIFF entry types, unused helpers, and the
+  global `String` identity conformance.
+
 ## v0.2.0 — 2026-07-26
 
 Deep-review round: every service and view audited (code smells + UX traps),
