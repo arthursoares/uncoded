@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.2.1 — 2026-10-19
 
 - Revert verifies appended metadata as well as in-place patches, refusing
   same-length edits made after a fix. New journals also verify partial
