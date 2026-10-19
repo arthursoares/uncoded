@@ -55,7 +55,9 @@ enum LensNameParser {
             // Multi-focal lenses list all focals; use the last one to agree
             // with format B, where the regex lands on the number next to "mm".
             let focalPart = m.groups[2].split(separator: "-").last.map(String.init) ?? m.groups[2]
-            if let focal = Double(focalPart) {
+            if let focal = Double(focalPart), focal.isFinite,
+               focal.rounded() >= 0, focal.rounded() < Double(Int.max),
+               (aperture * 100).rounded() < Double(Int.max) {
                 return (Int(focal.rounded()), Int((aperture * 100).rounded()),
                         lower.replacingCharacters(in: m.range, with: " "))
             }
@@ -63,7 +65,9 @@ enum LensNameParser {
 
         // Format B (catalog): "50mm f/1.2", "16-18-21mm f/4"
         if let m = firstMatch(#"([0-9.]+)\s*mm\s*f/([0-9.]+)"#, in: lower),
-           let focal = Double(m.groups[1]), let aperture = Double(m.groups[2]), aperture > 0 {
+           let focal = Double(m.groups[1]), let aperture = Double(m.groups[2]), aperture > 0,
+           focal.isFinite, focal.rounded() >= 0, focal.rounded() < Double(Int.max),
+           (aperture * 100).rounded() < Double(Int.max) {
             return (Int(focal.rounded()), Int((aperture * 100).rounded()),
                     lower.replacingCharacters(in: m.range, with: " "))
         }

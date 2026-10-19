@@ -1,5 +1,6 @@
 import SwiftUI
 import SwiftData
+import UniformTypeIdentifiers
 
 /// The user's real lenses, engraved like barrel markings. The 6-bit code a
 /// lens wears is part of its identity, so it's chosen when the lens is added
@@ -9,6 +10,12 @@ struct LensesView: View {
     @Environment(\.modelContext) private var context
     @State private var showAdd = false
     @State private var lensToRecode: UserLens?
+    @State private var showImportPicker = false
+    @State private var pickerIsSetup = false
+    @State private var importRequest: LensImportRequest?
+    @State private var showExport = false
+    @State private var setupDocument = LensSetupDocument(data: Data())
+    @State private var transferError: String?
 
     var body: some View {
         Group {
@@ -27,6 +34,8 @@ struct LensesView: View {
                     Button("Add Lens…") { showAdd = true }
                         .buttonStyle(.borderedProminent)
                         .tint(Theme.accent)
+                    Button("Extract Lens Metadata…") { chooseImport(setup: false) }
+                    Button("Import Lens Setup…") { chooseImport(setup: true) }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -48,6 +57,17 @@ struct LensesView: View {
         .background(Theme.bg)
         .navigationTitle("My Lenses")
         .toolbar {
+            Menu {
+                Button("Extract Lens Metadata…") { chooseImport(setup: false) }
+                Button("Import Lens Setup…") { chooseImport(setup: true) }
+                Divider()
+                Button("Export Lens Setup…") { exportSetup() }
+                    .disabled(lenses.isEmpty)
+            } label: {
+                Label("Import and Export", systemImage: "arrow.up.arrow.down")
+            }
+            .accessibilityLabel("Import and Export")
+            .help("Extract lens metadata, import a setup, or export your lenses")
             Button {
                 showAdd = true
             } label: {
@@ -56,6 +76,37 @@ struct LensesView: View {
         }
         .sheet(isPresented: $showAdd) { AddLensSheet() }
         .sheet(item: $lensToRecode) { lens in ChangeCodeSheet(lens: lens) }
+        .sheet(item: $importRequest) { request in LensImportSheet(request: request) }
+        .fileImporter(isPresented: $showImportPicker,
+                      allowedContentTypes: pickerIsSetup ? [.json] : [UTType(filenameExtension: "dng") ?? .rawImage, .tiff],
+                      allowsMultipleSelection: !pickerIsSetup) { result in
+            switch result {
+            case .success(let files):
+                if !files.isEmpty { importRequest = LensImportRequest(files: files, isSetup: pickerIsSetup) }
+            case .failure(let error): transferError = error.localizedDescription
+            }
+        }
+        .fileExporter(isPresented: $showExport, document: setupDocument,
+                      contentType: .json, defaultFilename: "Uncoded-Lens-Setup") { result in
+            if case .failure(let error) = result { transferError = error.localizedDescription }
+        }
+        .alert("Lens Setup", isPresented: Binding(
+            get: { transferError != nil }, set: { if !$0 { transferError = nil } }
+        )) {
+            Button("OK") { transferError = nil }
+        } message: { Text(transferError ?? "") }
+    }
+
+    private func chooseImport(setup: Bool) {
+        pickerIsSetup = setup
+        showImportPicker = true
+    }
+
+    private func exportSetup() {
+        do {
+            setupDocument = LensSetupDocument(data: try LensSetupArchive.encode(lenses: lenses))
+            showExport = true
+        } catch { transferError = error.localizedDescription }
     }
 
     /// A live scan may hold this lens as a per-frame override; tell it to let
@@ -64,6 +115,24 @@ struct LensesView: View {
         NotificationCenter.default.post(name: .uncodedLensWillDelete,
                                         object: lens.persistentModelID)
         context.delete(lens)
+    }
+}
+
+private struct LensSetupDocument: FileDocument {
+    static var readableContentTypes: [UTType] { [.json] }
+    var data: Data
+
+    init(data: Data) { self.data = data }
+
+    init(configuration: ReadConfiguration) throws {
+        guard let data = configuration.file.regularFileContents else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        self.data = data
+    }
+
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        FileWrapper(regularFileWithContents: data)
     }
 }
 

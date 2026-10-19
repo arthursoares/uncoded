@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Extract lens entries from selected reference DNGs, including EXIF/XMP
+  lens details and Adobe profile references. Review and edit entries before
+  importing; identical entries are grouped and unreadable files are reported.
+- Export and import a portable lens setup with all saved lens details and
+  code mappings. Imports use the same review screen and preserve existing
+  lenses and code assignments instead of silently replacing them.
+
 ## v0.2.2 — 2026-10-19
 
 - Fix false "Not enough free space" errors on external disks such as ExFAT.
