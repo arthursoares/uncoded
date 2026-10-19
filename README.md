@@ -37,6 +37,17 @@ metadata with the truth.
 - **Manual overrides** — mark frames grease-pencil style and assign any
   lens directly: for adapted glass with no code, or days when one borrowed
   code served two lenses.
+- **Import lens entries** — in **My Lenses → Import and Export → Extract
+  Lens Metadata…**, select reference DNGs to recover their lens and Adobe
+  profile details. Review or edit each entry before adding it. Corrected
+  files may no longer identify the borrowed code; select it during import
+  or assign it later.
+- **Move your setup between Macs** — **Export Lens Setup…** saves your
+  lens definitions and all code mappings as a JSON file. On the other Mac,
+  choose **Import Lens Setup…** and review the entries. Existing lenses and
+  code assignments are preserved; conflicting imports need a distinct name
+  or code. Adobe profiles must be installed separately; undo journals stay
+  on the Mac that made the fixes.
 - **Fix** — one click rewrites lens make, model, focal length, and the
   Adobe lens-correction profile (`crs:LensProfile*`) so Lightroom shows
   your real lens with the right profile.

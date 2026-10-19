@@ -58,6 +58,15 @@ final class LensNameParserTests: XCTestCase {
         XCTAssertNil(LensNameParser.key(of: "N/A"))
     }
 
+    func testOversizedImportedLensSpecsCannotCrashCodeSuggestions() {
+        let huge = String(repeating: "9", count: 100)
+        for name in ["Mystery \(huge)mm f/2", "Mystery 35mm f/\(huge)",
+                     "Mystery 1:2/\(huge)", "Mystery 1:\(huge)/35"] {
+            XCTAssertNil(LensNameParser.parse(name))
+            XCTAssertNil(LensNameParser.key(of: name))
+        }
+    }
+
     func testSixBitTableMatchesCameraString() {
         let match = SixBitTable.match(lensModel: "Summicron-M 1:2/28 ASPH.")
         XCTAssertNotNil(match)
