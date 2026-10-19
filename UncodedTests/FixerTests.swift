@@ -103,6 +103,73 @@ final class FixerTests: XCTestCase {
         XCTAssertNotNil(store.journal(for: file))
     }
 
+    func testZeroImportantCapacityDoesNotRejectAvailableExternalDiskSpace() throws {
+        // ExFAT on a real external disk reports important=0 despite hundreds
+        // of GB available. Exercise both the backup and metadata-only paths.
+        for backup in [false, true] {
+            let file = tempDir.appendingPathComponent("external-\(backup).dng")
+            let original = makeTIFF()
+            try original.write(to: file)
+            let externalFixer = Fixer(store: store, volumeCapacity: { directory in
+                XCTAssertEqual(directory.path, file.deletingLastPathComponent().path)
+                return (important: 0, available: 512 * 1024 * 1024)
+            })
+
+            try externalFixer.fix(file: file, with: write, keepBak: backup)
+            XCTAssertNotNil(store.journal(for: file))
+            XCTAssertEqual(FileManager.default.fileExists(atPath: file.appendingPathExtension("bak").path), backup)
+            try externalFixer.revert(file: file)
+            XCTAssertEqual(try Data(contentsOf: file), original)
+        }
+    }
+
+    func testUnavailableImportantCapacityStillChecksOrdinaryFreeSpace() throws {
+        let file = tempDir.appendingPathComponent("photo.dng")
+        let original = makeTIFF()
+        try original.write(to: file)
+        let fullDisk = Fixer(store: store, volumeCapacity: { _ in (important: nil, available: 0) })
+
+        XCTAssertThrowsError(try fullDisk.fix(file: file, with: write, keepBak: true)) { error in
+            XCTAssertTrue(error.localizedDescription.contains("Not enough free space"))
+        }
+        XCTAssertEqual(try Data(contentsOf: file), original)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.appendingPathExtension("bak").path))
+        XCTAssertTrue(journalFiles().isEmpty)
+    }
+
+    func testGenuinelyInsufficientSpaceRefusesBeforeBackupJournalOrWrite() throws {
+        for free in [0, 1024] {
+            let file = tempDir.appendingPathComponent("full-\(free).dng")
+            let original = makeTIFF()
+            try original.write(to: file)
+            let fullDisk = Fixer(store: store, volumeCapacity: { _ in
+                (important: Int64(free), available: free)
+            })
+
+            for backup in [false, true] {
+                XCTAssertThrowsError(try fullDisk.fix(file: file, with: write, keepBak: backup)) { error in
+                    XCTAssertTrue(error.localizedDescription.contains("Not enough free space"))
+                }
+                XCTAssertEqual(try Data(contentsOf: file), original)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: file.appendingPathExtension("bak").path))
+                XCTAssertTrue(journalFiles().isEmpty)
+            }
+        }
+    }
+
+    func testImportantCapacityStillIncludesReclaimableSpace() throws {
+        let file = tempDir.appendingPathComponent("photo.dng")
+        let original = makeTIFF()
+        try original.write(to: file)
+        let reclaimingDisk = Fixer(store: store, volumeCapacity: { _ in
+            (important: 512 * 1024 * 1024, available: 0)
+        })
+
+        try reclaimingDisk.fix(file: file, with: write, keepBak: true)
+        try reclaimingDisk.revert(file: file)
+        XCTAssertEqual(try Data(contentsOf: file), original)
+    }
+
     func testExistingBakIsNeverOverwritten() throws {
         let file = tempDir.appendingPathComponent("photo.dng")
         let original = makeTIFF()
@@ -815,6 +882,25 @@ final class FixerTests: XCTestCase {
     }
 
     // MARK: - The scan settles (runs only when UNCODED_TEST_DNG points at a DNG)
+
+    func testFixWithRealSourceVolumeCapacityIfProvided() throws {
+        guard let path = ProcessInfo.processInfo.environment["UNCODED_TEST_DNG"], !path.isEmpty
+        else { throw XCTSkip("set UNCODED_TEST_DNG to a real DNG to run this") }
+
+        let source = URL(fileURLWithPath: path)
+        let original = try Data(contentsOf: source)
+        let file = tempDir.appendingPathComponent("volume-capacity.dng")
+        try original.write(to: file)
+        // Read the real source volume's capacity, but mutate only a temporary
+        // copy. This exercises ExFAT's zero important-usage result safely.
+        let capacity = fixer.volumeCapacity(source.deletingLastPathComponent())
+        let sourceVolumeFixer = Fixer(store: store, volumeCapacity: { _ in capacity })
+
+        try sourceVolumeFixer.fix(file: file, with: write, keepBak: true)
+        try sourceVolumeFixer.revert(file: file)
+        XCTAssertEqual(try Data(contentsOf: file), original)
+        XCTAssertEqual(try Data(contentsOf: source), original)
+    }
 
     /// A fix has to end. The scan plan puts an already-fixed frame back in the
     /// fix set whenever `differs` says the write would change something, so a

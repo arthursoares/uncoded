@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.2.2 — 2026-10-19
+
+- Fix false "Not enough free space" errors on external disks such as ExFAT.
+  The space check now considers ordinary available capacity alongside the
+  important-usage estimate, which can report zero despite ample free space.
+  Truly insufficient space is still rejected before creating a backup or
+  undo journal or modifying the DNG.
+
 ## v0.2.1 — 2026-10-19
 
 - Revert verifies appended metadata as well as in-place patches, refusing
