@@ -336,12 +336,24 @@ struct Fixer: Sendable {
     /// Resolves an installed .lcp's digest from its filename. Injectable so tests
     /// don't depend on which profiles Adobe happens to have installed.
     let profileDigest: @Sendable (String) -> String?
+    /// Query independently: external filesystems can report zero or no value
+    /// for important usage while the ordinary capacity still reports free bytes.
+    let volumeCapacity: @Sendable (URL) -> (important: Int64?, available: Int?)
 
     init(store: JournalStore = .default,
          profileDigest: @escaping @Sendable (String) -> String?
-             = { LCPIndex.cachedDigest(forProfileNamed: $0) }) {
+             = { LCPIndex.cachedDigest(forProfileNamed: $0) },
+         volumeCapacity: @escaping @Sendable (URL) -> (important: Int64?, available: Int?)
+             = { directory in
+                 let important = try? directory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+                     .volumeAvailableCapacityForImportantUsage
+                 let available = try? directory.resourceValues(forKeys: [.volumeAvailableCapacityKey])
+                     .volumeAvailableCapacity
+                 return (important, available)
+             }) {
         self.store = store
         self.profileDigest = profileDigest
+        self.volumeCapacity = volumeCapacity
     }
 
     static let `default` = Fixer()
@@ -667,9 +679,11 @@ struct Fixer: Sendable {
             guard let size = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize else { return }
             needed += Int64(size)
         }
-        guard let free = try? file.deletingLastPathComponent()
-            .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-            .volumeAvailableCapacityForImportantUsage
+        let capacity = volumeCapacity(file.deletingLastPathComponent())
+        // Keep reclaimable capacity on APFS without treating an unsupported
+        // important-usage result on ExFAT as proof that the disk is full.
+        guard let free = [capacity.important, capacity.available.map { Int64($0) }]
+            .compactMap({ $0 }).filter({ $0 >= 0 }).max()
         else { return }
         guard free < needed else { return }
 
