@@ -62,13 +62,9 @@ struct JournalStore: Sendable {
     /// Where the shared store keeps its journals (shown in Settings).
     static var directory: URL { `default`.directory }
 
-    static func fixedPaths() -> Set<String> { `default`.fixedPaths() }
-
     static func sealedURLs(in candidates: [URL]) -> SealResult {
         `default`.sealedURLs(in: candidates)
     }
-
-    static func journal(for file: URL) -> JournalRecord? { `default`.journal(for: file) }
 
     // MARK: - Reading
 
@@ -93,37 +89,11 @@ struct JournalStore: Sendable {
         return index
     }
 
-    /// What a stored journal means for the file it names.
-    ///
-    /// A commit writes the appendix, flushes, writes the value patches,
-    /// flushes, then writes the pointer patches — so an interrupted one leaves
-    /// the file in one of a handful of states, and the journal (which holds
-    /// every region's bytes before *and* after) can tell which:
-    ///
-    ///     length \ patched regions   all pre-write   all post-write   mixed
-    ///     originalLength             abandoned       interrupted¹     interrupted
-    ///     part of an appendix³       appendix only²  unverified       unverified
-    ///     writtenLength              appendix only²  landed           interrupted
-    ///     anything else              unverified      unverified       unverified
-    ///
-    /// Any region holding bytes from neither state ⇒ unverified, whatever the
-    /// length: something other than us wrote there and only the user knows
-    /// what it was. `unverified` is also where an unreadable file lands.
-    ///
-    /// The interrupted states are recoverable *because* every region is provably
-    /// one of ours: restoring the pre-write bytes and truncating to
-    /// `originalLength` puts the file back where it started. Only pending
-    /// journals are audited at all — a committed one plus a mixed file is not
-    /// an interrupted write, it is a file edited after the fix.
-    ///
-    /// ¹ patches without the appendix that was written first: pathological, but
-    ///   the fields would point past end-of-file, so recover rather than seal.
-    /// ² the appendix landed — all or part of it — and no patch did.
-    /// ³ `originalLength < length < writtenLength`: the appendix write itself
-    ///   died part way, which a full disk does. Nothing on disk differs from the
-    ///   original file except the fragment past `originalLength`. Post-write or
-    ///   mixed regions at that length would mean patches landed before the
-    ///   appendix they depend on, which `commit` cannot do — so, unverified.
+    /// Classifies pending writes after verifying patches and every present appendix byte.
+    /// Commit flushes the appendix before values, then pointers. A partial appendix
+    /// is recoverable only while all patches remain original. Mixed patches are
+    /// recoverable at original/full length; foreign bytes always remain unverified.
+    /// Committed journals stay visible even when later edits prevent safe revert.
     enum Resolution: Equatable {
         /// The write is on disk (or the journal predates the pending split).
         case landed
@@ -174,13 +144,7 @@ struct JournalStore: Sendable {
             return .interrupted
         case let length where length > journal.originalLength
             && length < journal.writtenLength && audit.allOriginal:
-            // The appendix write died part way through — a full disk inside the
-            // very first write of the commit. Every patched region is still
-            // pre-write, so the only thing on disk that is not the original file
-            // is the fragment past originalLength. This used to fall to
-            // `unverified`, which sealed the frame as maybe-fixed, skipped it in
-            // recovery, and left revert refusing it on its length check: a frame
-            // with no way back from a write that never touched its metadata.
+            // An interrupted first write: audit verified the exact appendix prefix.
             return .abandonedWithAppendix
         default:
             return .unverified

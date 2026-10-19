@@ -51,6 +51,8 @@ metadata with the truth.
 - **Every fix is undoable.** A byte-level journal records exactly what
   changed; *Revert Fix* restores the file **byte-for-byte** (verified by
   hash in the test suite). Journals survive app restarts.
+  Revert refuses if modified metadata no longer matches the journal, or
+  an older journal lacks the appended bytes needed to verify it safely.
 - **`.bak` copies** (Settings, on by default): a one-time pristine sibling
   copy before the first fix ever touches a file.
 - The writer is validated against ExifTool's field readout and

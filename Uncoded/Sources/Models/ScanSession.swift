@@ -6,23 +6,14 @@ import SwiftData
 struct Resolution {
     let lens: UserLens?
     let isManual: Bool
-    /// True when the file's own metadata already claims this lens — a frame
-    /// Uncoded (or an older version of it) has fixed before, whether or not an
-    /// undo journal survived to seal it.
+    /// True when the file's own metadata already claims this lens.
     var isClaimed = false
 }
 
 /// Per-file fix outcome for the current session.
 enum FrameFix {
-    /// A write that landed. `warnings` carries what `Fixer.FixOutcome` had to
-    /// say about a fix that nonetheless succeeded — a .bak that no longer
-    /// matches the file it was made from, most of all. The frame keeps its
-    /// FIXED seal: the warning is about the backup, not about the write.
     case fixed(warnings: [String])
     case failed(String)
-    /// A revert that did not happen — the file changed since the fix, or its
-    /// journal is gone. The bytes on disk are still ours, so the frame keeps
-    /// its FIXED seal and revert stays reachable instead of stranding.
     case revertRefused(String)
 
     /// True while the bytes on disk carry our write.
@@ -38,16 +29,6 @@ enum FrameFix {
         return false
     }
 
-    /// The full, untruncated explanation, if there is one.
-    var message: String? {
-        switch self {
-        case .fixed(let warnings):
-            return warnings.isEmpty ? nil : warnings.joined(separator: "\n\n")
-        case .failed(let message), .revertRefused(let message): return message
-        }
-    }
-
-    /// Things that went sideways around a write that still landed.
     var warnings: [String] {
         if case .fixed(let warnings) = self { return warnings }
         return []
@@ -81,6 +62,14 @@ extension Notification.Name {
 /// from the Scan tab and back doesn't clear the opened folder.
 @Observable
 final class ScanSession {
+    struct ScanResult: Sendable {
+        var outcome: DNGScanner.Outcome
+        var sealed: Set<URL> = []
+        var renamedFrom: [URL: String] = [:]
+    }
+
+    typealias ScanOperation = @Sendable (URL) async -> ScanResult
+
     var folder: URL?
     var results: [ScannedDNG] = []
     var scanning = false
@@ -107,6 +96,8 @@ final class ScanSession {
     var folderReadable = true
 
     @ObservationIgnored var batchTask: Task<Void, Never>?
+    @ObservationIgnored private var scanTask: Task<Void, Never>?
+    @ObservationIgnored private var scanGeneration = 0
     @ObservationIgnored private var lensDeletionObserver: NSObjectProtocol?
 
     var busyNow: Bool { busy != nil }
@@ -121,6 +112,8 @@ final class ScanSession {
     }
 
     deinit {
+        scanTask?.cancel()
+        batchTask?.cancel()
         if let lensDeletionObserver {
             NotificationCenter.default.removeObserver(lensDeletionObserver)
         }
@@ -133,5 +126,69 @@ final class ScanSession {
         guard !stale.isEmpty else { return }
         for url in stale { overrides[url] = nil }
         selection.subtract(stale)
+    }
+
+    @discardableResult
+    @MainActor
+    func scan(_ url: URL) -> Task<Void, Never>? {
+        scan(url, using: { url in await Self.performScan(url) })
+    }
+
+    @discardableResult
+    @MainActor
+    func scan(_ url: URL, using operation: @escaping ScanOperation) -> Task<Void, Never>? {
+        guard !busyNow else { return nil }
+
+        scanGeneration &+= 1
+        let generation = scanGeneration
+        scanTask?.cancel()
+        prepareToScan(url)
+
+        let task = Task { [weak self] in
+            let result = await operation(url)
+            guard let self, self.scanGeneration == generation else { return }
+            self.commit(result)
+            self.scanTask = nil
+        }
+        scanTask = task
+        return task
+    }
+
+    @MainActor
+    private func prepareToScan(_ url: URL) {
+        folder = url
+        scanning = true
+        results = []
+        selection = []
+        overrides = [:]
+        fixState = [:]
+        renamedFrom = [:]
+        unreadableCount = 0
+        skippedSubfolders = 0
+        folderReadable = true
+        showFailuresOnly = false
+        lastRunSummary = nil
+    }
+
+    @MainActor
+    private func commit(_ result: ScanResult) {
+        results = result.outcome.files
+        unreadableCount = result.outcome.unreadable
+        skippedSubfolders = result.outcome.skippedSubfolders
+        folderReadable = result.outcome.folderReadable
+        for file in result.outcome.files where result.sealed.contains(file.url) {
+            fixState[file.url] = .fixed(warnings: [])
+        }
+        renamedFrom = result.renamedFrom
+        scanning = false
+    }
+
+    private static func performScan(_ url: URL) async -> ScanResult {
+        await Task.detached(priority: .userInitiated) {
+            let outcome = DNGScanner.scan(folder: url)
+            let seals = JournalStore.sealedURLs(in: outcome.files.map(\.url))
+            return ScanResult(outcome: outcome, sealed: seals.sealed,
+                              renamedFrom: seals.renamedFrom)
+        }.value
     }
 }

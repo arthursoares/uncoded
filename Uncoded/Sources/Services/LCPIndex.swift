@@ -97,13 +97,8 @@ enum LCPIndex {
         return digest(of: match.url)
     }
 
-    /// The same lookup, memoised for the duration of the run.
-    ///
-    /// The fix path asks this once per frame, and a batch is hundreds of frames
-    /// over a handful of lenses: without the cache each one would re-walk the
-    /// profile tree and re-hash the same file. Both the answer and the absence of
-    /// one are cached — a profile that isn't installed won't become installed
-    /// mid-batch, and if it does the next launch picks it up.
+    /// Caches hits and misses until the next launch, avoiding a directory walk
+    /// and profile hash for every frame in a batch.
     static func cachedDigest(forProfileNamed filename: String) -> String? {
         digestCache.digest(forProfileNamed: filename)
     }
@@ -128,17 +123,8 @@ enum LCPIndex {
     }
 }
 
-/// Keeps `UserLens.profileDigest` in step with the .lcp files actually installed.
-///
-/// v0.1.x left the digest empty on every lens, so every fix it made wrote
-/// `crs:LensProfileDigest=""` — a profile reference Lightroom cannot resolve. The
-/// .lcp filename was recorded though, and the digest is derived from the file, so
-/// those rows can be repaired without asking the user anything.
-///
-/// The same trap catches a digest that was once right: Camera Raw ships a revised
-/// .lcp under the same filename and every stored digest for it goes stale. The
-/// digest exists only to name the file on this machine, so whenever the two
-/// disagree the installed file wins.
+/// Repairs empty legacy digests and refreshes digests when Adobe updates an
+/// installed .lcp under the same filename. The installed file is authoritative.
 enum LensProfileBackfill {
     /// Adopts the indexed digest wherever a lens's own differs. Returns how many
     /// lenses were repaired.

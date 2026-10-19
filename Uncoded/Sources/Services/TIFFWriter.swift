@@ -17,14 +17,8 @@ struct LensWrite: Sendable {
         !(profileName.isEmpty && profileFilename.isEmpty && profileDigest.isEmpty)
     }
 
-    /// XMP `aux:LensInfo`: min focal, max focal, min aperture, max aperture as
-    /// space-separated rationals — the XMP twin of EXIF LensSpecification.
-    ///
-    /// The CLI's `exiftool -LensInfo=` populated *both* ExifIFD:LensInfo and
-    /// XMP-aux:LensInfo. Writing only the EXIF one leaves the camera's original
-    /// aux:LensInfo in place, which describes the *borrowed* Leica lens —
-    /// usually at the wrong maximum aperture — and that is the copy Lightroom
-    /// shows.
+    /// XMP's EXIF LensSpecification twin: min/max focal and aperture rationals.
+    /// Lightroom reads this copy, so it must agree with the EXIF values.
     var xmpLensInfo: String? {
         guard let focal = focalMM, let aperture = apertureF,
               let f = Self.rational(focal), let a = Self.rational(aperture)
@@ -32,14 +26,8 @@ struct LensWrite: Sendable {
         return "\(f) \(f) \(a) \(a)"
     }
 
-    /// What EXIF LensSpecification will read as once this write lands, in the
-    /// reader's own rendering. Nil when the lens has no usable numbers — then
-    /// the write leaves FocalLength and LensSpecification alone.
-    ///
-    /// Quantized the way `setRationals` quantizes: it stores every value over a
-    /// denominator of 1000, so a lens with a fourth decimal place comes back off
-    /// the grid it went on. Comparing the raw value against the rounded one on
-    /// disk would leave that lens asking to be rewritten for ever.
+    /// Reader-format LensSpecification, quantized to the writer's denominator of 1000.
+    /// Compare stored precision so a rounded value does not trigger endless re-fixes.
     var lensSpecText: String? {
         guard let focal = focalMM, let aperture = apertureF,
               focal.isFinite, aperture.isFinite,
@@ -67,25 +55,9 @@ struct LensWrite: Sendable {
 }
 
 extension LensWrite {
-    /// Whether writing this lens would change anything the file already says.
-    ///
-    /// Comparing the claimed lens *name* is not enough to spot the case this
-    /// exists for: a frame fixed by v0.1.x claims exactly the right name beside
-    /// an empty `crs:LensProfileDigest`, and rewriting it is the only repair.
-    ///
-    /// Only the fields this write actually sets are compared, and only where it
-    /// would set them to something: `xmpProperties` skips empty values and
-    /// writes no `crs:LensProfile*` at all for a lens with no profile, so an
-    /// empty value here changes nothing on disk and must not read as a
-    /// difference — otherwise a hand-typed lens would ask to be rewritten
-    /// forever.
-    ///
-    /// Which is also why an orphan `crs:LensProfileSetup="Custom"` — what
-    /// v0.1.1 left on a no-profile lens, a profile reference naming nothing —
-    /// is *not* counted as a difference, however much it deserves to be: the
-    /// writer only ever sets properties, so a fix cannot clear it, and flagging
-    /// a state no fix can reach is a frame that asks to be rewritten for ever.
-    /// Repairing those files needs the writer to learn to remove a property.
+    /// Compares only fields this write sets, including the profile digest.
+    /// Empty properties and orphan profile setup are ignored: the writer does not
+    /// remove them, so flagging them would offer a fix that cannot settle.
     func differs(from metadata: TIFFReader.LensMetadata) -> Bool {
         func matches(_ value: String, _ current: String?) -> Bool {
             let value = value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -97,11 +69,7 @@ extension LensWrite {
               // aux:Lens gets the model too; a half-landed fix leaves the two
               // disagreeing, and that is a frame worth rewriting.
               matches(lensModel, metadata.auxLens),
-              // The focal length and maximum aperture, in EXIF and in the XMP
-              // copy Lightroom actually shows. v0.1.1 wrote only the EXIF one,
-              // leaving aux:LensInfo describing the borrowed Leica lens at its
-              // wrong maximum aperture — for a lens with no Adobe profile that
-              // is the whole of what a repair has to put right.
+              // Keep EXIF and the XMP copy Lightroom reads consistent.
               matches(lensSpecText ?? "", metadata.lensSpec),
               matches(xmpLensInfo ?? "", metadata.auxLensInfo)
         else { return true }
@@ -137,6 +105,9 @@ struct WriteJournal: Codable {
     var state: State?
     var bak: BakRecord?
     var sample: ContentSample?
+    /// Exact bytes permit verification of both a complete append and an interrupted prefix.
+    /// Absent in older journals, which cannot safely authorize truncating appended data.
+    var appendix: Data?
 
     /// A journal is written before the bytes change, so a record on disk does
     /// not by itself mean the write happened.
@@ -158,11 +129,8 @@ struct WriteJournal: Codable {
         }
     }
 
-    /// A slice of the file outside every patched region — image data, in
-    /// practice. The patched regions hold lens strings and a length, which two
-    /// frames shot with the same lens share; this is what makes the fingerprint
-    /// frame-unique. Absent in v0.1.x journals, which then match on the
-    /// patches alone.
+    /// Samples untouched bytes to distinguish frames with identical lens metadata.
+    /// Legacy journals without this sample rely on the recorded write regions.
     struct ContentSample: Codable {
         let offset: Int
         let length: Int
@@ -202,14 +170,18 @@ struct WriteJournal: Codable {
     }
 
     func audit(_ data: Data) -> PatchAudit {
-        guard originalLength >= 0, appendedBytes >= 0, !patches.isEmpty, sampleMatches(data) else {
+        guard originalLength >= 0, appendedBytes >= 0,
+              originalLength <= Int.max - appendedBytes,
+              data.count >= originalLength, data.count <= writtenLength,
+              !patches.isEmpty, sampleMatches(data), appendixMatches(data) else {
             return PatchAudit(allOriginal: false, allNew: false, anyForeign: true)
         }
         var audit = PatchAudit(allOriginal: true, allNew: true, anyForeign: false)
         for patch in patches {
             // A patch whose two sides differ in length can't be reasoned about
             // — and restoring it would move every byte after it.
-            guard patch.original.count == patch.new.count else {
+            guard patch.original.count == patch.new.count, patch.offset >= 0,
+                  patch.offset <= originalLength - patch.new.count else {
                 return PatchAudit(allOriginal: false, allNew: false, anyForeign: true)
             }
             let isOriginal = holds(patch.original, at: patch.offset, in: data)
@@ -221,14 +193,22 @@ struct WriteJournal: Codable {
         return audit
     }
 
-    /// True when `data` is exactly what this write leaves behind.
+    /// Matches the written length, patches, appendix, and unchanged content sample.
     func describesWrittenBytes(_ data: Data) -> Bool {
-        data.count == writtenLength && audit(data).allNew
+        audit(data).allNew && data.count == writtenLength
     }
 
     /// True when `data` is still the pre-write file — the write never landed.
     func describesOriginalBytes(_ data: Data) -> Bool {
         data.count == originalLength && audit(data).allOriginal
+    }
+
+    /// Only bytes actually present at EOF need to match during interrupted recovery.
+    private func appendixMatches(_ data: Data) -> Bool {
+        let present = data.count - originalLength
+        guard let appendix else { return present == 0 }
+        return appendix.count == appendedBytes
+            && data.suffix(present) == appendix.prefix(present)
     }
 
     /// The sample sits inside the original length and outside every patch, so
@@ -251,7 +231,8 @@ struct WriteJournal: Codable {
         guard url.path != filePath else { return self }
         return WriteJournal(filePath: url.path, date: date, originalLength: originalLength,
                             patches: patches, appendedBytes: appendedBytes,
-                            originalFileName: fileName, state: state, bak: bak, sample: sample)
+                            originalFileName: fileName, state: state, bak: bak, sample: sample,
+                            appendix: appendix)
     }
 }
 
@@ -259,6 +240,7 @@ enum TIFFWriteError: Error, LocalizedError {
     case missingTag(String)
     case corruptStructure
     case fileChangedSinceFix
+    case legacyAppendixUnverifiable
     case nonTextTag(tag: UInt16, type: UInt16)
     case undecodableXMP
     case malformedXMP(String)
@@ -271,6 +253,8 @@ enum TIFFWriteError: Error, LocalizedError {
         switch self {
         case .missingTag(let tag): return "File has no \(tag) field to update"
         case .corruptStructure: return "File structure not understood; refusing to write"
+        case .legacyAppendixUnverifiable:
+            return "This older undo record does not contain the appended metadata needed to verify a safe revert. To recover the original, restore a verified backup manually."
         case .fileChangedSinceFix:
             return "This file changed since Uncoded fixed it — reverting would damage it. Restore the .bak copy instead."
         case .nonTextTag(let tag, let type):
@@ -371,19 +355,11 @@ struct TIFFWriter {
     static func revert(_ journal: WriteJournal) throws {
         let url = URL(fileURLWithPath: journal.filePath)
         let data = try Data(contentsOf: url, options: .mappedIfSafe)
-        // A journal is a file on disk like any other: treat its numbers as
-        // untrusted too, or a hand-edited (or truncated) one traps here.
-        guard journal.originalLength >= 0, journal.appendedBytes >= 0,
-              journal.originalLength == data.count - journal.appendedBytes else {
-            throw TIFFWriteError.fileChangedSinceFix
+        if journal.appendedBytes > 0, journal.appendix == nil {
+            throw TIFFWriteError.legacyAppendixUnverifiable
         }
-        for patch in journal.patches {
-            guard patch.offset >= 0, patch.original.count == patch.new.count,
-                  patch.offset <= data.count - patch.new.count,
-                  data.subdata(in: patch.offset..<(patch.offset + patch.new.count)) == patch.new
-            else {
-                throw TIFFWriteError.fileChangedSinceFix
-            }
+        guard journal.describesWrittenBytes(data) else {
+            throw TIFFWriteError.fileChangedSinceFix
         }
 
         let handle = try FileHandle(forWritingTo: url)
@@ -975,7 +951,8 @@ struct TIFFWriter {
                             originalLength: originalLength,
                             patches: recorded, appendedBytes: appendix.count,
                             originalFileName: url.lastPathComponent,
-                            state: .pending, sample: contentSample(besides: recorded))
+                            state: .pending, sample: contentSample(besides: recorded),
+                            appendix: appendix)
     }
 
     /// Picks a window of untouched bytes near end-of-file — image data, on a
@@ -997,21 +974,9 @@ struct TIFFWriter {
         return nil
     }
 
-    /// Proves the file still holds the bytes the plan was made against, at the
-    /// last possible moment before the first write.
-    ///
-    /// Matching lengths are not enough. Planning happens well before the write:
-    /// in between, Uncoded copies the file to `.bak` and saves an undo record,
-    /// and that window is wide enough for Lightroom to write its own metadata
-    /// back — an in-place edit, or an atomic replace, either of which can leave
-    /// the length untouched. Patching planned offsets into bytes that have moved
-    /// would corrupt them, and the journal would afterwards "revert" the file to
-    /// bytes that were never there, throwing away the other writer's work.
-    ///
-    /// Only the regions this write will overwrite, plus the journal's sample of
-    /// untouched content, are re-read — a few KB of what may be a 100 MB raw.
-    /// The mapped copy `data` is no use for this: an in-place edit shows through
-    /// a mapping, so the "original" bytes it holds may already be the new ones.
+    /// Re-reads patches and the content sample through the write descriptor.
+    /// Planning may precede backup/journal I/O; a mapped Data view can reflect edits
+    /// made since planning and cannot supply an independent comparison.
     private func verifyPlannedBytes(_ journal: WriteJournal, using handle: FileHandle) throws {
         func bytes(at offset: Int, _ count: Int) throws -> Data? {
             try handle.seek(toOffset: UInt64(offset))
