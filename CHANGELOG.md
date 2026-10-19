@@ -8,6 +8,8 @@
 - Older journals remain readable, but undo refuses when appended bytes
   cannot be verified. The DNG and its journal are preserved; a verified
   original backup can be restored manually.
+- The stronger undo checks require v0.2.1 or later. Older app versions do
+  not verify appended metadata; avoid downgrading while undo journals remain.
 - Starting a new scan prevents an older scan from replacing its results.
 - Grid and list views share frame status and context-menu actions, including
   code mapping. Removed duplicate TIFF entry types, unused helpers, and the
