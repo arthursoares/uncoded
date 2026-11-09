@@ -20,14 +20,15 @@ struct ScanView: View {
     @State private var confirmRevertMarked = false
     @State private var addLensCode: CodeSelection?
     @State private var codeToMap: CodeSelection?
+    @State private var showAddLens = false
 
     private enum FixScope { case all, marked }
 
     /// Why a frame is in the fix set — first write, rewrite after the user
     /// re-assigned an already-fixed frame, or a retry of a failed write.
-    private enum FixKind { case first, refix, retry }
+    enum FixKind { case first, refix, retry }
 
-    private struct FixTarget {
+    struct FixTarget {
         let file: ScannedDNG
         let lens: UserLens
         let kind: FixKind
@@ -36,7 +37,7 @@ struct ScanView: View {
     /// One pass over the scan: what every frame resolves to, what a Fix would
     /// write, and the header counts. Built once per render so cells do O(1)
     /// lookups instead of re-walking the results.
-    private struct ScanPlan {
+    struct ScanPlan {
         private(set) var resolutions: [URL: Resolution] = [:]
         private(set) var targets: [FixTarget] = [] // scan order
         private(set) var targetByURL: [URL: FixTarget] = [:]
@@ -139,6 +140,15 @@ struct ScanView: View {
             resolutions[file.url] ?? Resolution(lens: nil, isManual: false)
         }
 
+        /// A selection keeps its scope even when none of its photos need a
+        /// write. Other pending photos require the separate, explicit All action.
+        func primaryTargets(selection: Set<URL>, failuresOnly: Bool) -> [FixTarget] {
+            let candidates = failuresOnly && failureCount > 0
+                ? targets.filter { $0.kind == .retry } : targets
+            return selection.isEmpty ? candidates
+                : candidates.filter { selection.contains($0.file.url) }
+        }
+
         /// The lens a fixed frame has since been re-assigned to, if any.
         func refixLens(for file: ScannedDNG) -> UserLens? {
             guard let target = targetByURL[file.url], target.kind == .refix else { return nil }
@@ -156,8 +166,7 @@ struct ScanView: View {
     /// While the grid is filtered to failures, Fix acts on what's visible —
     /// a button that counts hidden frames would be lying.
     private func allTargets(_ plan: ScanPlan) -> [FixTarget] {
-        guard session.showFailuresOnly, plan.failureCount > 0 else { return plan.targets }
-        return plan.targets.filter { $0.kind == .retry }
+        plan.primaryTargets(selection: [], failuresOnly: session.showFailuresOnly)
     }
 
     private func markedTargets(_ plan: ScanPlan) -> [FixTarget] {
@@ -198,10 +207,12 @@ struct ScanView: View {
         .toolbar {
             if !session.results.isEmpty {
                 Picker("View", selection: $session.viewMode) {
-                    Image(systemName: "square.grid.3x2").tag(ScanViewMode.sheet)
-                    Image(systemName: "list.bullet").tag(ScanViewMode.list)
+                    Label("Contact Sheet", systemImage: "square.grid.3x2").tag(ScanViewMode.sheet)
+                    Label("List", systemImage: "list.bullet").tag(ScanViewMode.list)
                 }
+                .labelStyle(.iconOnly)
                 .pickerStyle(.segmented)
+                .accessibilityLabel("Photo view")
             }
             Button {
                 showPicker = true
@@ -215,7 +226,17 @@ struct ScanView: View {
             if case let .success(url) = result { scan(url) }
         }
         .safeAreaInset(edge: .bottom) {
-            if !session.selection.isEmpty { markBar }
+            if !session.selection.isEmpty && !session.scanning { markBar }
+        }
+        .onChange(of: session.showFailuresOnly) { _, _ in
+            let visible = Set(displayed(plan).map(\.file.url))
+            session.select(session.selection.intersection(visible))
+        }
+        .onChange(of: session.busyNow) { _, busy in
+            if !busy {
+                let visible = Set(displayed(plan).map(\.file.url))
+                session.select(session.selection.intersection(visible))
+            }
         }
         .confirmationDialog(fixDialogTitle(plan), isPresented: $confirmFix,
                             titleVisibility: .visible) {
@@ -239,7 +260,7 @@ struct ScanView: View {
             Text(revertMessage)
         }
         .confirmationDialog(
-            "Revert \(markedReverts.count) marked fix\(markedReverts.count == 1 ? "" : "es")?",
+            "Revert \(markedReverts.count) selected fix\(markedReverts.count == 1 ? "" : "es")?",
             isPresented: $confirmRevertMarked, titleVisibility: .visible
         ) {
             Button("Revert Fixes") { runRevert(markedReverts) }
@@ -254,6 +275,7 @@ struct ScanView: View {
             MapCodeSheet(code: selection.code,
                          existing: mappings.first { $0.code == selection.code })
         }
+        .sheet(isPresented: $showAddLens) { AddLensSheet() }
     }
 
     // MARK: - Empty states
@@ -383,6 +405,10 @@ struct ScanView: View {
                 unclaimedBanner(top)
             }
 
+            if !session.scanning {
+                selectionControls(plan)
+            }
+
             Divider().overlay(Theme.panelEdge)
 
             switch session.viewMode {
@@ -400,9 +426,24 @@ struct ScanView: View {
                              busy: session.busyNow)
             case .list:
                 List(displayed(plan), id: \.file.id) { frame in
-                    ScanRow(file: frame.file, resolution: plan.resolution(for: frame.file),
-                            fix: session.fixState[frame.file.url],
-                            refixLens: plan.refixLens(for: frame.file))
+                    Button {
+                        toggleMark(frame.file)
+                    } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: session.selection.contains(frame.file.url)
+                                  ? "checkmark.circle.fill" : "circle")
+                                .foregroundStyle(session.selection.contains(frame.file.url)
+                                                 ? Theme.accent : Theme.dim)
+                            ScanRow(file: frame.file, resolution: plan.resolution(for: frame.file),
+                                    fix: session.fixState[frame.file.url],
+                                    refixLens: plan.refixLens(for: frame.file))
+                        }
+                        .contentShape(Rectangle())
+                    }
+                        .buttonStyle(.plain)
+                        .disabled(session.busyNow)
+                        .accessibilityAddTraits(session.selection.contains(frame.file.url) ? .isSelected : [])
+                        .accessibilityHint("Select this photo for lens assignment or fixing")
                         .listRowSeparatorTint(Theme.panelEdge)
                         .contextMenu {
                             ScanFrameContextMenu(
@@ -418,6 +459,34 @@ struct ScanView: View {
                 .scrollContentBackground(.hidden)
             }
         }
+        .onCommand(#selector(NSResponder.selectAll(_:))) {
+            session.select(Set(displayed(plan).map(\.file.url)))
+        }
+    }
+
+    private func selectionControls(_ plan: ScanPlan) -> some View {
+        let visible = Set(displayed(plan).map(\.file.url))
+        let unresolved = Set(displayed(plan).compactMap { frame in
+            plan.resolution(for: frame.file).lens == nil ? frame.file.url : nil
+        })
+        return HStack(spacing: 12) {
+            Button("Select All Visible") { session.select(visible) }
+                .keyboardShortcut("a", modifiers: .command)
+            Button("Select Unresolved") { session.select(unresolved) }
+                .keyboardShortcut("a", modifiers: [.command, .shift])
+                .disabled(unresolved.isEmpty)
+            Text("Select photos, then assign a lens.")
+                .font(.system(size: 11))
+                .foregroundStyle(Theme.dim)
+            Spacer()
+            if lenses.isEmpty {
+                Button("Add Your First Lens…") { showAddLens = true }
+                    .controlSize(.small)
+            }
+        }
+        .disabled(session.busyNow)
+        .padding(.horizontal, 16)
+        .padding(.bottom, 10)
     }
 
     @ViewBuilder
@@ -469,6 +538,7 @@ struct ScanView: View {
             )
         }
         .buttonStyle(.plain)
+        .disabled(session.busyNow)
         .help(session.showFailuresOnly ? "Show all frames" : "Show only the frames that failed")
     }
 
@@ -494,30 +564,25 @@ struct ScanView: View {
     @ViewBuilder
     private func fixButtons(_ plan: ScanPlan) -> some View {
         let all = allTargets(plan)
-        let marked = markedTargets(plan)
-        if !marked.isEmpty {
-            Button(fixLabel(marked, marked: true)) {
-                fixScope = .marked
+        let primary = plan.primaryTargets(selection: session.selection,
+                                          failuresOnly: session.showFailuresOnly)
+        let hasSelection = !session.selection.isEmpty
+        if hasSelection || !primary.isEmpty {
+            Button(fixLabel(primary, marked: hasSelection)) {
+                fixScope = hasSelection ? .marked : .all
                 confirmFix = true
             }
             .buttonStyle(.borderedProminent)
             .tint(Theme.accent)
             .controlSize(.small)
-            if all.count > marked.count {
+            .disabled(primary.isEmpty)
+            if hasSelection && all.count > primary.count {
                 Button("\(verb(all)) all \(all.count)") {
                     fixScope = .all
                     confirmFix = true
                 }
                 .controlSize(.small)
             }
-        } else if !all.isEmpty {
-            Button(fixLabel(all, marked: false)) {
-                fixScope = .all
-                confirmFix = true
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(Theme.accent)
-            .controlSize(.small)
         }
     }
 
@@ -530,7 +595,7 @@ struct ScanView: View {
 
     private func fixLabel(_ targets: [FixTarget], marked: Bool) -> String {
         let count = targets.count
-        if marked { return "\(verb(targets)) \(count) marked" }
+        if marked { return "\(targets.isEmpty ? "Fix" : verb(targets)) \(count) selected" }
         if targets.allSatisfy({ $0.kind == .retry }) { return "Retry \(count) failed" }
         return "\(verb(targets)) \(count) frame\(count == 1 ? "" : "s")"
     }
@@ -555,8 +620,8 @@ struct ScanView: View {
                 .foregroundStyle(Theme.rebate)
             Spacer()
             if group.contested {
-                Button(group.count == 1 ? "Mark This Frame" : "Mark These \(group.count) Frames") {
-                    session.selection = Set(group.frames)
+                Button(group.count == 1 ? "Select This Photo" : "Select These \(group.count) Photos") {
+                    session.select(Set(group.frames))
                 }
                 .controlSize(.small)
                 .buttonStyle(.borderedProminent)
@@ -564,8 +629,9 @@ struct ScanView: View {
                 .disabled(session.busyNow)
             } else if let code = group.codes.first, group.codes.count == 1 {
                 if !lenses.isEmpty {
-                    Button("Map to a Lens…") { codeToMap = CodeSelection(code: code) }
+                    Button("Set Lens for This Code…") { codeToMap = CodeSelection(code: code) }
                         .controlSize(.small)
+                        .help("Save a lens mapping for all photos with this code, including future scans")
                 }
                 Button("Add Lens…") { addLensCode = CodeSelection(code: code) }
                     .controlSize(.small)
@@ -573,7 +639,7 @@ struct ScanView: View {
                     .tint(Theme.accent)
             } else {
                 if !lenses.isEmpty {
-                    Menu("Map a Code…") {
+                Menu("Set Lens for a Code…") {
                         ForEach(group.codes, id: \.self) { code in
                             Button("Code \(code)…") {
                                 codeToMap = CodeSelection(code: code)
@@ -599,6 +665,7 @@ struct ScanView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
         .background(Theme.rebate.opacity(0.08))
+        .disabled(session.busyNow)
     }
 
     private func unclaimedText(_ group: ScanPlan.UnclaimedGroup) -> String {
@@ -606,7 +673,7 @@ struct ScanView: View {
         let subject = "\(count) frame\(count == 1 ? "" : "s") wear\(count == 1 ? "s" : "")"
         let codes = group.codes.joined(separator: " or ")
         if group.contested {
-            return "\(subject) code \(codes) — \(group.codes.count == 2 ? "both" : "those") codes are mapped, to different lenses, so Uncoded won't pick between them; mark \(count == 1 ? "it" : "them") and assign the lens you actually used"
+            return "\(subject) code \(codes) — the possible codes belong to different lenses. Select these photos and assign the lens you used."
         }
         guard group.codes.count > 1 else {
             return "\(subject) code \(codes) — not claimed by any of your lenses yet"
@@ -617,34 +684,36 @@ struct ScanView: View {
 
     /// Grease-pencil action bar for the marked frames.
     private var markBar: some View {
-        HStack(spacing: 14) {
-            HStack(spacing: 6) {
-                Circle().fill(Theme.accent).frame(width: 6, height: 6)
-                Text("\(session.selection.count) marked")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(Theme.engraved)
-            }
-            Spacer()
-            Menu {
-                assignMenu(for: session.selection)
-            } label: {
-                Label("Assign Lens", systemImage: "camera.aperture")
-            }
-            .menuStyle(.borderedButton)
-            .fixedSize()
-            .disabled(lenses.isEmpty || session.busyNow)
-            if lenses.isEmpty {
-                Text("add lenses under “My Lenses” first")
-                    .font(.system(size: 10))
-                    .foregroundStyle(Theme.faint)
-            }
-            if !markedReverts.isEmpty {
-                Button("Revert \(markedReverts.count) Marked Fix\(markedReverts.count == 1 ? "" : "es")…") {
-                    confirmRevertMarked = true
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 14) {
+                HStack(spacing: 6) {
+                    Circle().fill(Theme.accent).frame(width: 6, height: 6)
+                    Text("\(session.selection.count) selected")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Theme.engraved)
                 }
-                .disabled(session.busyNow)
+                Spacer()
+                Menu {
+                    assignMenu(for: session.selection)
+                } label: {
+                    Label("Assign Lens to Selected", systemImage: "camera.aperture")
+                }
+                .menuStyle(.borderedButton)
+                .fixedSize()
+                .disabled(lenses.isEmpty || session.busyNow)
+                if !markedReverts.isEmpty {
+                    Button("Revert \(markedReverts.count) Selected Fix\(markedReverts.count == 1 ? "" : "es")…") {
+                        confirmRevertMarked = true
+                    }
+                    .disabled(session.busyNow)
+                }
+                Button("Clear") { session.clearSelection() }
+                    .disabled(session.busyNow)
+                .keyboardShortcut(.escape, modifiers: [])
             }
-            Button("Deselect") { session.selection = [] }
+            Text("Lens assignments apply to these photos only, while this folder is open.")
+                .font(.system(size: 11))
+                .foregroundStyle(Theme.dim)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
@@ -653,15 +722,17 @@ struct ScanView: View {
 
     @ViewBuilder
     private func assignMenu(for urls: Set<URL>) -> some View {
+        Text("Use lens for these photos only")
         ForEach(lenses) { lens in
             Button(lens.name) { assign(lens, to: urls) }
+                .disabled(session.busyNow || session.scanning)
         }
         if urls.contains(where: { session.overrides[$0] != nil }) {
             Divider()
             Button("Remove manual override") {
-                for url in urls { session.overrides[url] = nil }
-                session.selection = []
+                session.removeOverrides(for: urls)
             }
+            .disabled(session.busyNow || session.scanning)
         }
     }
 
@@ -674,12 +745,11 @@ struct ScanView: View {
     }
 
     private func toggleMark(_ file: ScannedDNG) {
-        session.selection.formSymmetricDifference([file.url])
+        session.toggleSelection(file.url)
     }
 
     private func assign(_ lens: UserLens, to urls: Set<URL>) {
-        for url in urls { session.overrides[url] = lens }
-        session.selection = []
+        session.assign(lens, to: urls)
     }
 
     // MARK: - Dialog copy
@@ -879,9 +949,10 @@ private struct ScanFrameContextMenu<AssignMenu: View>: View {
         } else if resolution.lens == nil, !file.codeCandidates.isEmpty {
             Divider()
             ForEach(file.codeCandidates, id: \.code) { candidate in
-                Button("Map Code \(candidate.code) to a Lens…") {
+                Button("Set Lens for Code \(candidate.code)…") {
                     onMapCode(candidate.code)
                 }
+                .disabled(busy)
             }
         }
     }
@@ -909,14 +980,21 @@ private struct ContactSheet<AssignMenu: View>: View {
                       spacing: 16) {
                 ForEach(frames, id: \.file.id) { frame in
                     let file = frame.file
-                    FrameCell(file: file,
-                              frameNumber: frame.number,
-                              resolution: resolve(file),
-                              fix: fixInfo(file),
-                              refixLens: refixLens(file),
-                              renamedFrom: renamedFrom(file),
-                              selected: isSelected(file))
-                        .onTapGesture { onTap(file) }
+                    Button {
+                        onTap(file)
+                    } label: {
+                        FrameCell(file: file,
+                                  frameNumber: frame.number,
+                                  resolution: resolve(file),
+                                  fix: fixInfo(file),
+                                  refixLens: refixLens(file),
+                                  renamedFrom: renamedFrom(file),
+                                  selected: isSelected(file))
+                    }
+                        .buttonStyle(.plain)
+                        .disabled(busy)
+                        .accessibilityAddTraits(isSelected(file) ? .isSelected : [])
+                        .accessibilityHint("Select this photo for lens assignment or fixing")
                         .contextMenu {
                             ScanFrameContextMenu(
                                 file: file,
@@ -1131,6 +1209,8 @@ private struct FrameCell: View {
         )
         .contentShape(Rectangle())
         .help(helpText)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(helpText)
         .task { image = await ThumbnailLoader.thumbnail(for: file.url) }
     }
 
@@ -1162,7 +1242,7 @@ private struct FrameCell: View {
             lines.append("right-click to try the revert again")
         case .failed(let message):
             lines.append("fix failed: \(message)")
-            lines.append("the file was left untouched — mark this frame to try again")
+            lines.append("the file was left untouched — select this photo to try again")
         case nil:
             break
         }

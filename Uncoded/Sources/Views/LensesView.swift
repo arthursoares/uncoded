@@ -219,6 +219,9 @@ struct AddLensSheet: View {
     @State private var profileDigest = ""
     @State private var selectedCode: String?
     @State private var codeAutoSelected = true
+    @State private var pendingTransfer: MappingTransferRequest?
+    @State private var showTransferConfirmation = false
+    @State private var ownershipChangedMessage: String?
 
     private var filtered: [LCPProfile] {
         guard !search.isEmpty else { return profiles }
@@ -306,6 +309,11 @@ struct AddLensSheet: View {
             HStack {
                 Button("Cancel") { dismiss() }
                 Spacer()
+                if let ownershipChangedMessage {
+                    Text(ownershipChangedMessage)
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.accent)
+                }
                 if selectedCode == nil {
                     Text("pick the code this lens wears")
                         .font(.system(size: 10))
@@ -320,6 +328,15 @@ struct AddLensSheet: View {
         .frame(minWidth: 800, minHeight: 560)
         .background(Theme.bg)
         .preferredColorScheme(.dark)
+        .alert("Transfer 6-Bit Code?", isPresented: $showTransferConfirmation,
+               presenting: pendingTransfer) { transfer in
+            Button("Cancel", role: .cancel) {}
+            Button("Transfer Code", role: .destructive) {
+                save(confirming: transfer)
+            }
+        } message: { transfer in
+            Text("Code \(transfer.code) currently belongs to “\(transfer.oldOwnerName)”. Transfer it to “\(transfer.newOwnerName)”?" )
+        }
         .onAppear {
             if let preselectedCode, selectedCode == nil {
                 selectedCode = preselectedCode
@@ -356,17 +373,52 @@ struct AddLensSheet: View {
         }
     }
 
-    private func save() {
+    private func save(confirming confirmation: MappingTransferRequest? = nil) {
         // The name is written into the file and read back trimmed, so stray
         // whitespace here would read as a mismatch on every later scan.
         let trim = { (s: String) in s.trimmingCharacters(in: .whitespacesAndNewlines) }
-        let lens = UserLens(name: trim(name), make: trim(make),
+        let savedName = trim(name)
+        if let code = selectedCode {
+            let authorization: MappingAuthorization
+            do {
+                authorization = try Mappings.authorization(
+                    for: code, newOwnerName: savedName, currentLens: nil,
+                    confirming: confirmation, in: context
+                )
+            } catch {
+                ownershipChangedMessage = "Couldn’t verify code ownership. No changes were made. Try again."
+                return
+            }
+            switch authorization {
+            case .allowed:
+                ownershipChangedMessage = nil
+                break
+            case .confirmationRequired(let transfer):
+                if confirmation != nil {
+                    pendingTransfer = nil
+                    ownershipChangedMessage = "Ownership changed to \(transfer.oldOwnerName). Choose Add Lens again to review the transfer."
+                    return
+                }
+                ownershipChangedMessage = nil
+                pendingTransfer = transfer
+                showTransferConfirmation = true
+                return
+            }
+        }
+
+        let lens = UserLens(name: savedName, make: trim(make),
                             focalLength: trim(focalLength), aperture: trim(aperture),
                             profileName: profileName,
                             profileFilename: profileFilename, profileDigest: profileDigest)
         context.insert(lens)
         if let code = selectedCode {
-            Mappings.assign(code: code, to: lens, in: context)
+            do {
+                try Mappings.assign(code: code, to: lens, in: context)
+            } catch {
+                context.delete(lens)
+                ownershipChangedMessage = "Couldn’t save the code mapping. No changes were made. Try again."
+                return
+            }
         }
         dismiss()
     }
@@ -383,6 +435,9 @@ private struct ChangeCodeSheet: View {
     /// Which of the lens's existing codes is being edited. `mappings` has no
     /// stable order, so a lens wearing several lets the user say which.
     @State private var editing: String?
+    @State private var pendingTransfer: MappingTransferRequest?
+    @State private var showTransferConfirmation = false
+    @State private var ownershipChangedMessage: String?
     private let currentCodes: [String]
 
     init(lens: UserLens) {
@@ -445,6 +500,11 @@ private struct ChangeCodeSheet: View {
             HStack {
                 Button("Cancel") { dismiss() }
                 Spacer()
+                if let ownershipChangedMessage {
+                    Text(ownershipChangedMessage)
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.accent)
+                }
                 // Clicking the current code again clears the selection, which
                 // un-codes the lens on save — name that instead of letting it
                 // hide behind a plain "Save", and don't put it on Return.
@@ -469,6 +529,15 @@ private struct ChangeCodeSheet: View {
         .frame(minWidth: 460, minHeight: 480)
         .background(Theme.bg)
         .preferredColorScheme(.dark)
+        .alert("Transfer 6-Bit Code?", isPresented: $showTransferConfirmation,
+               presenting: pendingTransfer) { transfer in
+            Button("Cancel", role: .cancel) {}
+            Button("Transfer Code", role: .destructive) {
+                save(confirming: transfer)
+            }
+        } message: { transfer in
+            Text("Code \(transfer.code) currently belongs to “\(transfer.oldOwnerName)”. Transfer it to “\(transfer.newOwnerName)”?" )
+        }
     }
 
     /// One of the lens's codes, engraved on a small plate.
@@ -492,21 +561,96 @@ private struct ChangeCodeSheet: View {
         .contentShape(Rectangle())
     }
 
-    private func save() {
-        Mappings.replace(editing, with: selection, for: lens, in: context)
+    private func save(confirming confirmation: MappingTransferRequest? = nil) {
+        if let selection {
+            let authorization: MappingAuthorization
+            do {
+                authorization = try Mappings.authorization(
+                    for: selection, newOwnerName: lens.name, currentLens: lens,
+                    confirming: confirmation, in: context
+                )
+            } catch {
+                ownershipChangedMessage = "Couldn’t verify code ownership. No changes were made. Try again."
+                return
+            }
+            switch authorization {
+            case .allowed:
+                ownershipChangedMessage = nil
+                break
+            case .confirmationRequired(let transfer):
+                if confirmation != nil {
+                    pendingTransfer = nil
+                    ownershipChangedMessage = "Ownership changed to \(transfer.oldOwnerName). Choose Save again to review the transfer."
+                    return
+                }
+                ownershipChangedMessage = nil
+                pendingTransfer = transfer
+                showTransferConfirmation = true
+                return
+            }
+        }
+        do {
+            try Mappings.replace(editing, with: selection, for: lens, in: context)
+        } catch {
+            ownershipChangedMessage = "Couldn’t save the code change. No changes were made. Try again."
+            return
+        }
         dismiss()
+    }
+}
+
+struct MappingTransferRequest: Identifiable {
+    let id = UUID()
+    let code: String
+    let oldOwner: UserLens
+    let oldOwnerName: String
+    let newOwnerName: String
+}
+
+enum MappingAuthorization {
+    case allowed
+    case confirmationRequired(MappingTransferRequest)
+
+    var isAllowed: Bool {
+        if case .allowed = self { return true }
+        return false
     }
 }
 
 /// Mapping bookkeeping shared by the sheets: one code belongs to one lens.
 enum Mappings {
+    /// Checks the live mapping immediately before an interactive mutation.
+    /// A confirmation only authorizes transfer from the owner it named; if
+    /// ownership changes while the alert is open, the new owner is shown and
+    /// must be confirmed separately.
+    static func authorization(for code: String, newOwnerName: String,
+                              currentLens: UserLens?,
+                              confirming confirmation: MappingTransferRequest?,
+                              in context: ModelContext) throws -> MappingAuthorization {
+        guard let owner = try mapping(for: code, in: context)?.lens else {
+            return .allowed
+        }
+        if let currentLens, owner === currentLens {
+            return .allowed
+        }
+        if let confirmation,
+           confirmation.code == code,
+           confirmation.oldOwner === owner,
+           confirmation.newOwnerName == newOwnerName {
+            return .allowed
+        }
+        return .confirmationRequired(MappingTransferRequest(
+            code: code, oldOwner: owner,
+            oldOwnerName: owner.name, newOwnerName: newOwnerName
+        ))
+    }
+
     /// Points `code` at `lens`, stealing it from any other lens that had it.
-    static func assign(code: String, to lens: UserLens, in context: ModelContext) {
+    static func assign(code: String, to lens: UserLens, in context: ModelContext) throws {
         // No lens row for a code the table doesn't list (a mapping made before
         // the placeholder slots were filtered out) — keep whatever name it had.
         let leicaName = SixBitTable.byCode[code]?.first?.lensName
-        let descriptor = FetchDescriptor<CodeMapping>(predicate: #Predicate { $0.code == code })
-        if let existing = (try? context.fetch(descriptor))?.first {
+        if let existing = try mapping(for: code, in: context) {
             existing.lens = lens
             if let leicaName { existing.leicaLensName = leicaName }
         } else {
@@ -517,12 +661,43 @@ enum Mappings {
     /// Swaps one of the lens's codes for another (or drops it when `new` is
     /// nil). The lens's other codes stay: a re-coded lens really does wear one
     /// code on its old files and another on the new ones.
-    static func replace(_ old: String?, with new: String?, for lens: UserLens, in context: ModelContext) {
+    static func replace(_ old: String?, with new: String?, for lens: UserLens,
+                        in context: ModelContext) throws {
+        // Fetch before removing the old mapping. A store read failure must
+        // leave the current code intact rather than partially applying a swap.
+        let needsNewMapping = new.map { code in
+            !lens.mappings.contains(where: { $0.code == code })
+        } ?? false
+        let existingNew: CodeMapping?
+        if let new, needsNewMapping {
+            existingNew = try mapping(for: new, in: context)
+        } else {
+            existingNew = nil
+        }
         if let old, old != new, let mapping = lens.mappings.first(where: { $0.code == old }) {
-            context.delete(mapping)
+            remove(mapping, in: context)
         }
-        if let new, !lens.mappings.contains(where: { $0.code == new }) {
-            assign(code: new, to: lens, in: context)
+        if let new, needsNewMapping {
+            let leicaName = SixBitTable.byCode[new]?.first?.lensName
+            if let existingNew {
+                existingNew.lens = lens
+                if let leicaName { existingNew.leicaLensName = leicaName }
+            } else {
+                context.insert(CodeMapping(code: new, leicaLensName: leicaName ?? "", lens: lens))
+            }
         }
+    }
+
+    /// Detaches both sides immediately so views and subsequent operations in
+    /// the same context do not continue to observe a queued-for-deletion code.
+    static func remove(_ mapping: CodeMapping, in context: ModelContext) {
+        mapping.lens?.mappings.removeAll { $0 === mapping }
+        mapping.lens = nil
+        context.delete(mapping)
+    }
+
+    private static func mapping(for code: String, in context: ModelContext) throws -> CodeMapping? {
+        let descriptor = FetchDescriptor<CodeMapping>(predicate: #Predicate { $0.code == code })
+        return try context.fetch(descriptor).first
     }
 }
