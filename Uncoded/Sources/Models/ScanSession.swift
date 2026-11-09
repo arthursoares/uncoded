@@ -102,6 +102,8 @@ final class ScanSession {
 
     var busyNow: Bool { busy != nil }
 
+    private var resultURLs: Set<URL> { Set(results.map(\.url)) }
+
     init() {
         lensDeletionObserver = NotificationCenter.default.addObserver(
             forName: .uncodedLensWillDelete, object: nil, queue: .main
@@ -126,6 +128,48 @@ final class ScanSession {
         guard !stale.isEmpty else { return }
         for url in stale { overrides[url] = nil }
         selection.subtract(stale)
+    }
+
+    /// Apply a per-frame lens without changing which frames are marked for
+    /// the next batch. Rows from an older render cannot create hidden state.
+    @MainActor
+    func assign(_ lens: UserLens, to urls: Set<URL>) {
+        guard !busyNow, !scanning else { return }
+        for url in urls.intersection(resultURLs) {
+            overrides[url] = lens
+        }
+    }
+
+    /// Remove per-frame choices while leaving the current batch scope alone.
+    @MainActor
+    func removeOverrides(for urls: Set<URL>) {
+        guard !busyNow, !scanning else { return }
+        for url in urls.intersection(resultURLs) {
+            overrides[url] = nil
+        }
+    }
+
+    /// Replace the marked scope with the visible result rows passed by a view.
+    @MainActor
+    func select(_ urls: Set<URL>) {
+        guard !busyNow, !scanning else { return }
+        selection = urls.intersection(resultURLs)
+    }
+
+    @MainActor
+    func toggleSelection(_ url: URL) {
+        guard !busyNow, !scanning, resultURLs.contains(url) else { return }
+        if selection.contains(url) {
+            selection.remove(url)
+        } else {
+            selection.insert(url)
+        }
+    }
+
+    @MainActor
+    func clearSelection() {
+        guard !busyNow, !scanning else { return }
+        selection.removeAll()
     }
 
     @discardableResult
@@ -156,11 +200,14 @@ final class ScanSession {
 
     @MainActor
     private func prepareToScan(_ url: URL) {
+        let rescanningSameFolder = folder?.standardizedFileURL == url.standardizedFileURL
         folder = url
         scanning = true
         results = []
-        selection = []
-        overrides = [:]
+        if !rescanningSameFolder {
+            selection = []
+            overrides = [:]
+        }
         fixState = [:]
         renamedFrom = [:]
         unreadableCount = 0
@@ -173,6 +220,9 @@ final class ScanSession {
     @MainActor
     private func commit(_ result: ScanResult) {
         results = result.outcome.files
+        let visibleURLs = Set(results.map(\.url))
+        selection.formIntersection(visibleURLs)
+        overrides = overrides.filter { visibleURLs.contains($0.key) }
         unreadableCount = result.outcome.unreadable
         skippedSubfolders = result.outcome.skippedSubfolders
         folderReadable = result.outcome.folderReadable
