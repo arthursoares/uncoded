@@ -60,7 +60,7 @@ final class LensEntryImportTests: XCTestCase {
         let context = try context()
         let owner = UserLens(name: "Existing lens", make: "Existing")
         context.insert(owner)
-        Mappings.assign(code: "000110", to: owner, in: context)
+        try Mappings.assign(code: "000110", to: owner, in: context)
         try context.save()
 
         XCTAssertThrowsError(try LensEntryImport.save([

@@ -104,6 +104,16 @@ struct MapCodeSheet: View {
     @Query(sort: \UserLens.name) private var lenses: [UserLens]
     @Environment(\.modelContext) private var context
     @Environment(\.dismiss) private var dismiss
+    @State private var selection: UserLens?
+    @State private var pendingTransfer: MappingTransferRequest?
+    @State private var showTransferConfirmation = false
+    @State private var ownershipChangedMessage: String?
+
+    init(code: String, existing: CodeMapping?) {
+        self.code = code
+        self.existing = existing
+        _selection = State(initialValue: existing?.lens)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -118,6 +128,11 @@ struct MapCodeSheet: View {
                 Spacer()
             }
 
+            Text("Use this lens for all photos with code \(code), including future scans. Individual photo assignments take priority.")
+                .font(.system(size: 11))
+                .foregroundStyle(Theme.dim)
+                .fixedSize(horizontal: false, vertical: true)
+
             if lenses.isEmpty {
                 Text("No lenses yet — add your real lenses under “My Lenses” first.")
                     .font(.system(size: 12))
@@ -126,7 +141,7 @@ struct MapCodeSheet: View {
                 List {
                     ForEach(lenses) { lens in
                         Button {
-                            assign(lens)
+                            selection = lens
                         } label: {
                             HStack {
                                 VStack(alignment: .leading, spacing: 2) {
@@ -138,7 +153,7 @@ struct MapCodeSheet: View {
                                         .foregroundStyle(Theme.dim)
                                 }
                                 Spacer()
-                                if existing?.lens === lens {
+                                if selection?.persistentModelID == lens.persistentModelID {
                                     Image(systemName: "checkmark")
                                         .foregroundStyle(Theme.accent)
                                 }
@@ -153,23 +168,71 @@ struct MapCodeSheet: View {
             HStack {
                 if existing != nil {
                     Button("Clear Mapping", role: .destructive) {
-                        if let existing { context.delete(existing) }
+                        if let existing { Mappings.remove(existing, in: context) }
                         dismiss()
                     }
                 }
                 Spacer()
-                Button("Done") { dismiss() }
+                if let ownershipChangedMessage {
+                    Text(ownershipChangedMessage)
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.accent)
+                }
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Save Mapping") { save() }
                     .keyboardShortcut(.defaultAction)
+                    .disabled(selection == nil)
             }
         }
         .padding(20)
         .frame(minWidth: 420, minHeight: 360)
         .background(Theme.bg)
         .preferredColorScheme(.dark)
+        .alert("Transfer 6-Bit Code?", isPresented: $showTransferConfirmation,
+               presenting: pendingTransfer) { transfer in
+            Button("Cancel", role: .cancel) {}
+            Button("Transfer Code", role: .destructive) {
+                save(confirming: transfer)
+            }
+        } message: { transfer in
+            Text("Code \(transfer.code) currently belongs to “\(transfer.oldOwnerName)”. Transfer it to “\(transfer.newOwnerName)”?" )
+        }
     }
 
-    private func assign(_ lens: UserLens) {
-        Mappings.assign(code: code, to: lens, in: context)
+    private func save(confirming confirmation: MappingTransferRequest? = nil) {
+        guard let lens = selection else { return }
+        let authorization: MappingAuthorization
+        do {
+            authorization = try Mappings.authorization(
+                for: code, newOwnerName: lens.name, currentLens: lens,
+                confirming: confirmation, in: context
+            )
+        } catch {
+            ownershipChangedMessage = "Couldn’t verify code ownership. No changes were made. Try again."
+            return
+        }
+        switch authorization {
+        case .allowed:
+            ownershipChangedMessage = nil
+            break
+        case .confirmationRequired(let transfer):
+            if confirmation != nil {
+                pendingTransfer = nil
+                ownershipChangedMessage = "Ownership changed to \(transfer.oldOwnerName). Choose Save Mapping again to review the transfer."
+                return
+            }
+            ownershipChangedMessage = nil
+            pendingTransfer = transfer
+            showTransferConfirmation = true
+            return
+        }
+        do {
+            try Mappings.assign(code: code, to: lens, in: context)
+        } catch {
+            ownershipChangedMessage = "Couldn’t save the code mapping. No changes were made. Try again."
+            return
+        }
         dismiss()
     }
 }

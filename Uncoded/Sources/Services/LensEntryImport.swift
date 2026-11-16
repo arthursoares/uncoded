@@ -74,7 +74,7 @@ enum LensEntryImport {
                                     profileDigest: entry.profileDigest)
                 context.insert(lens)
                 inserted.append(lens)
-                for code in selection.codes { Mappings.assign(code: code, to: lens, in: context) }
+                for code in selection.codes { try Mappings.assign(code: code, to: lens, in: context) }
             }
             try context.save()
             return inserted.count

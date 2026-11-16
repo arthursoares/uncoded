@@ -34,9 +34,13 @@ metadata with the truth.
   lens-correction profiles already installed with Lightroom / Camera Raw on
   your Mac, and pick the code it wears (the plausible borrow is suggested
   first). The full community 6-bit code table ships in the app.
-- **Manual overrides** — mark frames grease-pencil style and assign any
-  lens directly: for adapted glass with no code, or days when one borrowed
-  code served two lenses.
+- **Manual overrides** — select photos in the contact sheet or list and
+  assign a lens directly: for adapted glass with no code, or days when one
+  borrowed code served two lenses. Use **Select All Visible**
+  (⌘A) or **Select Unresolved** (⇧⌘A) for batches. Selection stays in
+  place for **Fix selected**, and assignments survive rescans of the same
+  folder while it remains open. Saved code mappings apply to all matching
+  photos and future scans; changing a code's owner requires confirmation.
 - **Import lens entries** — in **My Lenses → Import and Export → Extract
   Lens Metadata…**, select reference DNGs to recover their lens and Adobe
   profile details. Review or edit each entry before adding it. Corrected
